@@ -1,0 +1,213 @@
+openapi: 3.0.0
+info:
+  title: Distributed Message Broker API (Team 2)
+  description: |
+    API Contract chính thức cho Message Broker trung tâm.
+    Hệ thống hỗ trợ cả 2 cơ chế nhận tin nhắn cho Agent đích:
+    1. **Cơ chế PUSH (Webhook):** Broker chủ động đẩy tin nhắn thẳng vào endpoint `/webhook/receive` của Agent đích (Khuyên dùng).
+    2. **Cơ chế PULL (Polling):** Agent đích chủ động gọi API `GET /receive` của Broker để kéo tin nhắn về (Dùng khi Agent không có public endpoint hoặc bị rớt mạng).
+  version: 1.1.0
+servers:
+  - url: http://localhost:8080
+    description: Broker Local Server
+
+paths:
+  /send:
+    post:
+      summary: Nhận tin nhắn từ Agent nguồn (Ingestion)
+      description: Nhận Message Envelope từ Agent gửi và đưa vào hàng đợi (Queue) để định tuyến.
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: header
+          name: X-Trace-Id
+          required: true
+          schema:
+            type: string
+          description: Trace ID từ Team 4 (Observability) để truy vết toàn hệ thống.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageEnvelope'
+      responses:
+        '202':
+          description: Accepted - Broker đã nhận, lưu DB thành công (Pending) và sẽ đảm bảo giao hàng.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /receive:
+    get:
+      summary: Agent kéo tin nhắn về (Cơ chế PULL)
+      description: Dành cho các Agent dùng cơ chế Pull. Gọi API này để lấy các tin nhắn đang có status PENDING dành cho mình.
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: agent_id
+          required: true
+          schema:
+            type: string
+          description: "ID của Agent đang yêu cầu lấy tin nhắn (VD: team_08_news)."
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+            default: 10
+          description: "Số lượng tin nhắn tối đa muốn lấy trong 1 lần."
+      responses:
+        '200':
+          description: Trả về danh sách Message Envelope chưa được xử lý.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MessageEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /messages/{message_id}/ack:
+    post:
+      summary: Xác nhận đã xử lý xong tin nhắn (ACK)
+      description: |
+        RẤT QUAN TRỌNG: Sau khi Agent đích xử lý xong tin nhắn (dù nhận qua Push hay Pull), BẮT BUỘC phải gọi API này. 
+        Nếu không gọi, Broker sẽ coi như Agent bị sập và tự động GỬI LẠI (Retry) tin nhắn này sau vài giây.
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: message_id
+          required: true
+          schema:
+            type: string
+          description: ID của tin nhắn cần xác nhận (Lấy từ trường message_id trong Envelope).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - agent_id
+                - status
+              properties:
+                agent_id:
+                  type: string
+                  description: ID của Agent đang thực hiện báo cáo ACK.
+                status:
+                  type: string
+                  enum: [success, failed]
+                  description: Kết quả xử lý nghiệp vụ tại Agent.
+      responses:
+        '200':
+          description: Broker đã ghi nhận và xóa tin nhắn khỏi hàng đợi (Đổi thành Delivered/Completed).
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Bắt buộc truyền Token do Team 3 (Identity Gateway) cấp.
+
+  schemas:
+    MessageEnvelope:
+      type: object
+      description: Cấu trúc JSON chuẩn xác dùng để giao tiếp giữa các thành phần.
+      required:
+        - message_id
+        - timestamp
+        - from
+        - to
+        - type
+        - payload
+      properties:
+        message_id:
+          type: string
+          description: Khóa chính duy nhất. Dùng để Broker và Agent nhận diện chống gửi đúp (Idempotency).
+          example: "m123"
+        conversation_id:
+          type: string
+          description: ID của chuỗi hội thoại (Nếu có).
+          example: "conv42"
+        timestamp:
+          type: string
+          format: date-time
+          description: Thời gian tạo tin nhắn tại Agent nguồn (chuẩn ISO 8601).
+          example: "2026-10-18T20:34:00Z"
+        ttl:
+          type: integer
+          description: Thời gian sống của tin nhắn tính bằng giây (Time-To-Live). Nếu quá hạn sẽ bị đẩy vào Dead-letter queue.
+          example: 3600
+        from:
+          type: string
+          description: Định danh của Agent gửi.
+          example: "agent_A"
+        to:
+          type: string
+          description: Định danh của Agent nhận. Broker sẽ dựa vào đây để hỏi IP từ Team 1.
+          example: "team_08_news"
+        type:
+          type: string
+          enum: [request, response, final]
+          description: Phân loại mục đích của tin nhắn.
+        reply_to:
+          type: string
+          description: Chứa message_id của tin nhắn trước đó nếu đây là câu trả lời.
+          example: "m122"
+        payload:
+          type: object
+          description: Chứa dữ liệu nghiệp vụ thực tế (Data động tùy theo từng team).
+          example: 
+            action: "search"
+            keyword: "thời tiết hôm nay"
+
+    ErrorModel:
+      type: object
+      description: Cấu trúc lỗi chung trả về cho Client.
+      properties:
+        code:
+          type: integer
+          description: Mã lỗi ứng dụng hoặc HTTP Code.
+          example: 400
+        message:
+          type: string
+          description: Thông điệp mô tả lỗi chi tiết.
+          example: "Missing required field: timestamp"
+
+  responses:
+    BadRequest:
+      description: Yêu cầu không hợp lệ (sai format JSON, thiếu trường bắt buộc,...).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorModel'
+    Unauthorized:
+      description: Không có quyền truy cập (Thiếu hoặc sai token JWT).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorModel'
+    InternalServerError:
+      description: Lỗi hệ thống nội bộ của Broker (Database lỗi, mất kết nối Service Registry,...).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorModel'
