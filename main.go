@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,74 +10,59 @@ import (
 	"net/http"
 	"time"
 
+	"message-broker/broker"
 	"message-broker/models"
 )
 
-var agentBURL = "http://localhost:8081/webhook/receive"
+const (
+	agentBURL      = "http://localhost:8081/webhook/receive"
+	retryInterval  = 5 * time.Second
+	traceIDHeader  = "X-Trace-Id"
+	defaultTraceID = "default-trace-xyz"
+)
 
-func sendHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+var agentHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
-	var envelope models.MessageEnvelope
-	err := json.NewDecoder(r.Body).Decode(&envelope)
+// main constructs the broker, starts its delivery worker, and serves the HTTP API.
+func main() {
+	messageBroker, err := broker.New(deliverMessage, retryInterval)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(models.ErrorModel{
-			Code:    400,
-			Message: "Sai định dạng JSON: " + err.Error(),
-		})
-		return
+		log.Fatal(err)
 	}
 
-	// Lấy hoặc tự sinh mã Trace ID để phục vụ việc tracking
-	traceID := r.Header.Get("X-Trace-Id")
-	if traceID == "" {
-		traceID = "default-trace-xyz"
-	}
+	go messageBroker.RunWorker(context.Background())
 
-	log.Printf("[Broker][%s] Nhận tin nhắn ID: %s từ [%s] gửi đến [%s]", traceID, envelope.MessageID, envelope.From, envelope.To)
-
-	payloadBytes, _ := json.Marshal(envelope)
-
-	// Gọi bất đồng bộ (goroutine) chuyển tiếp sang Agent B kèm Trace ID
-	go forwardMessage(agentBURL, payloadBytes, traceID)
-
-	w.WriteHeader(http.StatusAccepted)
-	w.Write([]byte(fmt.Sprintf(`{"status": "Accepted", "trace_id": "%s", "message": "Broker đã tiếp nhận và đang định tuyến"}`, traceID)))
+	server := &apiServer{broker: messageBroker}
+	fmt.Println("Broker đang khởi động tại cổng :8080...")
+	log.Fatal(http.ListenAndServe(":8080", server.handler()))
 }
 
-func forwardMessage(targetURL string, payload []byte, traceID string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	req, err := http.NewRequest("POST", targetURL, bytes.NewBuffer(payload))
+// deliverMessage sends one envelope to the configured receiver webhook.
+func deliverMessage(ctx context.Context, envelope models.MessageEnvelope, traceID string) error {
+	payload, err := json.Marshal(envelope)
 	if err != nil {
-		log.Printf("[Broker Error][%s] Không tạo được HTTP request tới Agent B: %v", traceID, err)
-		return
+		return fmt.Errorf("encode message: %w", err)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Trace-Id", traceID)
-
-	resp, err := client.Do(req)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, agentBURL, bytes.NewReader(payload))
 	if err != nil {
-		log.Printf("[Broker Error][%s] Không kết nối được tới Agent đích: %v", traceID, err)
-		return
+		return fmt.Errorf("create request to agent: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(traceIDHeader, traceID)
+
+	resp, err := agentHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send message to agent: %w", err)
 	}
 	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode == http.StatusOK {
-		log.Printf("[Broker Success][%s] Agent B đã xử lý thành công! Phản hồi: %s", traceID, string(respBody))
-	} else {
-		log.Printf("[Broker Warning][%s] Agent B phản hồi mã lỗi HTTP: %s", traceID, resp.Status)
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return fmt.Errorf("read agent response: %w", err)
 	}
-}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("agent returned HTTP %s", resp.Status)
+	}
 
-func main() {
-	http.HandleFunc("/send", sendHandler)
-	fmt.Println("🚀 Broker (Phiên bản Bước 3 - Tracing & ACK) đang khởi động tại cổng :8080...")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Printf("[Broker][%s] Agent accepted message %s via HTTP %s; waiting for ACK", traceID, envelope.MessageID, resp.Status)
+	return nil
 }
