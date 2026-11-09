@@ -1,0 +1,9 @@
+.git
+.history
+.vscode
+.idea
+*.test
+*.out
+coverage.*
+Dockerfile
+docker-compose.yml

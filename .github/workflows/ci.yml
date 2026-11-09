@@ -1,0 +1,56 @@
+# CI cho mọi PR và mỗi lần merge vào main:
+#   1. go vet + go test -race với đúng phiên bản Go trong go.mod
+#   2. build Dockerfile thật, chạy docker compose và scripts/fault-demo.sh
+# Kết quả và log lỗi được ghi thành annotation để xem nhanh trong tab Checks của PR.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Go vet + test (race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: go vet
+        run: go vet ./... 2>&1 | tee vet.log
+      - name: go test -race
+        run: |
+          go test -race -count=1 ./... 2>&1 | tee test.log
+          echo "::notice title=Go test::$(go version) — $(grep -c '^ok' test.log) package(s) ok"
+      - name: Report failure
+        if: failure()
+        run: .github/report-logs.sh
+
+  docker:
+    name: Docker compose + fault demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build images
+        run: docker compose build 2>&1 | tee build.log
+      - name: Start stack
+        run: docker compose up -d --wait --wait-timeout 120 2>&1 | tee up.log
+      - name: Fault injection demo
+        run: |
+          ./scripts/fault-demo.sh 2>&1 | tr '\r' '\n' | grep -v 'đã xử lý [0-9]*/' | tee demo.log
+          echo "::notice title=Fault demo::$(grep '✅' demo.log) | $(grep 'Agent B:' demo.log)"
+      - name: Collect container logs
+        if: failure()
+        run: docker compose logs --no-color > compose.log 2>&1 || true
+      - name: Report failure
+        if: failure()
+        run: .github/report-logs.sh
+      - name: Stop stack
+        if: always()
+        run: docker compose down

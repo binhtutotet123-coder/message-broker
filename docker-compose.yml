@@ -1,0 +1,53 @@
+# Chạy toàn bộ hệ thống: docker compose up --build
+#   broker   :8080  Message Broker (Team 2)
+#   agent-b  :8081  Agent nhận giả lập (tự ACK, lọc trùng, xem /stats)
+#   registry :8082  Service Registry giả lập thay cho Team 1
+# Khi nối registry thật của Team 1: đổi REGISTRY_LOOKUP_URL của broker.
+
+x-app: &app
+  build: .
+  image: message-broker:local
+
+services:
+  broker:
+    <<: *app
+    environment:
+      BROKER_ADDR: ":8080"
+      RETRY_INTERVAL: "5s"
+      AGENT_ROUTES: "" # rỗng = chỉ định tuyến qua registry
+      REGISTRY_LOOKUP_URL: "http://registry:8082/agents/{agent_id}"
+      REGISTRY_CACHE_TTL: "30s"
+      FAULT_INJECTION: "true" # bật /admin/fault cho demo; đặt "false" khi chạy thật
+    ports:
+      - "8080:8080"
+    depends_on:
+      - registry
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  registry:
+    <<: *app
+    entrypoint: ["mock-registry"]
+    environment:
+      LISTEN_ADDR: ":8082"
+      AGENTS: "agent_B=http://agent-b:8081/webhook/receive"
+    ports:
+      - "8082:8082"
+
+  agent-b:
+    <<: *app
+    entrypoint: ["mock-agent-b"]
+    environment:
+      AGENT_ID: "agent_B"
+      LISTEN_ADDR: ":8081"
+      BROKER_URL: "http://broker:8080"
+      ACK_DROP_RATE: "0" # ví dụ 0.3 để giả lập mất 30% ACK
+      ACK_DELAY: "0s" # ví dụ 7s để ACK đến sau khi broker đã retry
+    ports:
+      - "8081:8081"
+    depends_on:
+      broker:
+        condition: service_healthy

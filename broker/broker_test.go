@@ -441,6 +441,60 @@ func TestMemoryStoreReclaimsExpiredLease(t *testing.T) {
 	}
 }
 
+// TestMemoryStoreCopiesPayloadMaps verifies callers never share the stored payload map.
+// Before the fix, cloneRecord decoded into the stored map, so a caller's write leaked
+// into the store and concurrent ACKs raced with the worker encoding the same map.
+func TestMemoryStoreCopiesPayloadMaps(t *testing.T) {
+	store := NewMemoryStore()
+	envelope := testEnvelope("payload-copy")
+	envelope.Payload = map[string]interface{}{"action": "test", "nested": map[string]interface{}{"k": "v"}}
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Accept(MessageRecord{Envelope: envelope, Encoded: encoded, Status: StatusPending}); err != nil {
+		t.Fatal(err)
+	}
+
+	first, _, err := store.Get(envelope.MessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Envelope.Payload["injected"] = true
+	first.Envelope.Payload["nested"].(map[string]interface{})["k"] = "changed"
+
+	second, _, err := store.Get(envelope.MessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, leaked := second.Envelope.Payload["injected"]; leaked {
+		t.Fatal("caller's write to a returned payload leaked into the store")
+	}
+	if got := second.Envelope.Payload["nested"].(map[string]interface{})["k"]; got != "v" {
+		t.Fatalf("nested payload value = %v, want v", got)
+	}
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				record, _, err := store.Get(envelope.MessageID)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if _, err := json.Marshal(record.Envelope); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 // testEnvelope creates a valid message shared by the broker unit tests.
 func testEnvelope(messageID string) models.MessageEnvelope {
 	return models.MessageEnvelope{

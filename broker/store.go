@@ -185,6 +185,9 @@ func (s *MemoryStore) Release(messageID, leaseToken string, retryAt time.Time) e
 // cloneRecord copies mutable fields so callers cannot mutate stored state.
 func cloneRecord(record MessageRecord) (MessageRecord, error) {
 	record.Encoded = append([]byte(nil), record.Encoded...)
+	// Start from an empty envelope: json.Unmarshal reuses existing maps, so decoding
+	// into the copied struct would write into the Payload map shared with the store.
+	record.Envelope = models.MessageEnvelope{}
 	if err := json.Unmarshal(record.Encoded, &record.Envelope); err != nil {
 		return MessageRecord{}, err
 	}
