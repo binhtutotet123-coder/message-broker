@@ -1,68 +1,51 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"message-broker/broker"
-	"message-broker/models"
+	"message-broker/fault"
 )
 
 const (
-	agentBURL      = "http://localhost:8081/webhook/receive"
-	retryInterval  = 5 * time.Second
 	traceIDHeader  = "X-Trace-Id"
 	defaultTraceID = "default-trace-xyz"
 )
 
 var agentHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
-// main constructs the broker, starts its delivery worker, and serves the HTTP API.
+// main loads configuration, wires routing and optional fault injection, and serves the API.
 func main() {
-	messageBroker, err := broker.New(deliverMessage, retryInterval)
+	cfg, err := loadConfig(os.LookupEnv)
+	if err != nil {
+		log.Fatalf("Config: %v", err)
+	}
+	resolver, err := newResolver(cfg)
+	if err != nil {
+		log.Fatalf("Routing: %v", err)
+	}
+
+	deliver := webhookDelivery{resolver: resolver, client: agentHTTPClient}.deliver
+	var injector *fault.Injector
+	if cfg.FaultInjection {
+		injector = fault.New(nil)
+		deliver = injector.Wrap(deliver)
+		log.Printf("Fault injection ENABLED: configure it with PUT /admin/fault")
+	}
+
+	messageBroker, err := broker.New(deliver, cfg.RetryInterval)
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	go messageBroker.RunWorker(context.Background())
 
-	server := &apiServer{broker: messageBroker}
-	fmt.Println("Broker đang khởi động tại cổng :8080...")
-	log.Fatal(http.ListenAndServe(":8080", server.handler()))
-}
-
-// deliverMessage sends one envelope to the configured receiver webhook.
-func deliverMessage(ctx context.Context, envelope models.MessageEnvelope, traceID string) error {
-	payload, err := json.Marshal(envelope)
-	if err != nil {
-		return fmt.Errorf("encode message: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, agentBURL, bytes.NewReader(payload))
-	if err != nil {
-		return fmt.Errorf("create request to agent: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(traceIDHeader, traceID)
-
-	resp, err := agentHTTPClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("send message to agent: %w", err)
-	}
-	defer resp.Body.Close()
-	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-		return fmt.Errorf("read agent response: %w", err)
-	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("agent returned HTTP %s", resp.Status)
-	}
-
-	log.Printf("[Broker][%s] Agent accepted message %s via HTTP %s; waiting for ACK", traceID, envelope.MessageID, resp.Status)
-	return nil
+	log.Printf("Routing: static routes for %d agent(s), registry lookup %q", len(cfg.AgentRoutes), cfg.RegistryLookupURL)
+	server := &apiServer{broker: messageBroker, faultInjector: injector}
+	fmt.Printf("Broker đang khởi động tại %s...\n", cfg.ListenAddr)
+	log.Fatal(http.ListenAndServe(cfg.ListenAddr, server.handler()))
 }

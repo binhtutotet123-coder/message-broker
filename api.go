@@ -9,11 +9,14 @@ import (
 	"strings"
 
 	"message-broker/broker"
+	"message-broker/fault"
 	"message-broker/models"
 )
 
 type apiServer struct {
 	broker *broker.Broker
+	// faultInjector, when set, exposes /admin/fault for fault-injection tests.
+	faultInjector *fault.Injector
 }
 
 type ackRequest struct {
@@ -28,7 +31,17 @@ func (s *apiServer) handler() http.Handler {
 	mux.HandleFunc("/send", s.sendHandler)
 	mux.HandleFunc("/ack", s.ackHandler)
 	mux.HandleFunc("/messages/", s.messageAckHandler)
+	mux.HandleFunc("/healthz", healthHandler)
+	if s.faultInjector != nil {
+		mux.Handle("/admin/fault", s.faultInjector.Handler())
+	}
 	return mux
+}
+
+// healthHandler reports liveness for Docker health checks.
+func healthHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Write([]byte("ok\n"))
 }
 
 // sendHandler validates and accepts a new envelope for asynchronous delivery.
