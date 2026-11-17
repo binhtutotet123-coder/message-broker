@@ -3,6 +3,10 @@
 Message Broker trung tâm (Team 2) cho hệ thống phân tán của lớp. Hợp đồng API nằm ở
 [`docs/swagger.yaml`](docs/swagger.yaml).
 
+> **Các nhóm Agent muốn kết nối:** broker đang chạy tại `http://103.81.84.102:8080`.
+> Đọc [**Hướng dẫn kết nối**](docs/HUONG-DAN-KET-NOI.md) và dùng agent mẫu
+> [`examples/python/agent.py`](examples/python/agent.py).
+
 ## Chạy nhanh bằng Docker
 
 ```bash
