@@ -23,6 +23,8 @@ curl -X POST localhost:8080/send -H 'Content-Type: application/json' -H 'X-Trace
 curl localhost:8081/stats
 ```
 
+Chạy trên server thật (chỉ broker, tắt Fault Injection): xem [`DEPLOY.md`](DEPLOY.md).
+
 ## Chạy không cần Docker
 
 ```bash

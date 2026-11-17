@@ -1,0 +1,47 @@
+# Cấu hình chạy broker trên server thật (docker-compose.yml là bản để demo/test):
+#   - chỉ broker mở cổng ra ngoài (8080), Fault Injection luôn TẮT
+#   - test-agent chạy nội bộ, không mở cổng, dùng để kiểm tra broker còn giao tin đúng
+#   - container tự khởi động lại khi lỗi hoặc khi server reboot
+#   - log mỗi container giới hạn 3 file x 10 MB để không đầy ổ cứng
+# Cấu hình đọc từ file .env (copy từ .env.example). File .env đặt sẵn
+# COMPOSE_FILE=docker-compose.server.yml nên trên server chỉ cần gõ `docker compose ...`.
+# Hướng dẫn đầy đủ: DEPLOY.md
+
+x-app: &app
+  build: .
+  image: message-broker:server
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  broker:
+    <<: *app
+    environment:
+      BROKER_ADDR: ":8080"
+      RETRY_INTERVAL: "${RETRY_INTERVAL:-5s}"
+      AGENT_ROUTES: "${AGENT_ROUTES:-agent_B=http://test-agent:8081/webhook/receive}"
+      REGISTRY_LOOKUP_URL: "${REGISTRY_LOOKUP_URL:-}"
+      REGISTRY_CACHE_TTL: "${REGISTRY_CACHE_TTL:-30s}"
+      FAULT_INJECTION: "false"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 2s
+      retries: 5
+
+  test-agent:
+    <<: *app
+    entrypoint: ["mock-agent-b"]
+    environment:
+      AGENT_ID: "agent_B"
+      LISTEN_ADDR: ":8081"
+      BROKER_URL: "http://broker:8080"
+    depends_on:
+      broker:
+        condition: service_healthy
