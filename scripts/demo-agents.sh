@@ -83,11 +83,15 @@ end_watch() {
 trap end_watch EXIT
 
 # dieu_phoi gửi một câu hỏi tới tin_tuc qua broker; ghi lại message_id vào MSG_ID.
+# In từng dòng ngay khi có (python -u, tee) để dòng "gửi REQUEST" hiện trước log của
+# broker, đúng thứ tự thật.
 send_ask() {
   local out
-  out=$(docker compose exec -T demo-dieu-phoi python demo_agents.py ask "$@")
-  printf '%s\n' "$out" | grep -v '^message_id='
-  MSG_ID=$(printf '%s\n' "$out" | sed -n 's/^message_id=//p')
+  out=$(mktemp)
+  docker compose exec -T demo-dieu-phoi python -u demo_agents.py ask "$@" \
+    | tee "$out" | grep --line-buffered -v '^message_id='
+  MSG_ID=$(sed -n 's/^message_id=//p' "$out")
+  rm -f "$out"
 }
 
 # Chờ tối đa $1 giây đến khi dieu_phoi nhận được câu trả lời cho MSG_ID.
