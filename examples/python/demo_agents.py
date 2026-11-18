@@ -71,6 +71,7 @@ def ask(args):
     trace = "demo-" + uuid.uuid4().hex[:8]
     print("[%s] gửi REQUEST tới tin_tuc: %s (conversation=%s, trace=%s)" % (
         agent.AGENT_ID, json.dumps(payload, ensure_ascii=False), conversation, trace))
+    time.sleep(0.3)  # để dòng trên kịp hiện ra trước log của broker
     result = agent.send_message("tin_tuc", payload, msg_type="request",
                                 conversation_id=conversation, trace_id=trace)
     print("[%s] broker trả 202 Accepted cho tin %s" % (agent.AGENT_ID, result["message_id"]))

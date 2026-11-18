@@ -73,9 +73,19 @@ begin_watch() {
   sleep 1
 }
 
+# Tắt phần hiện log. "docker compose" chạy thành hai tiến trình: docker và plugin compose
+# (tiến trình con). Khi chạy trong terminal, docker không chuyển tín hiệu tắt cho plugin,
+# nên phải tắt cả tiến trình con, không thì script treo ở đây.
 end_watch() {
   if [ -n "$LOGS_PID" ]; then
+    pkill -TERM -P "$LOGS_PID" 2>/dev/null || true
     kill "$LOGS_PID" 2>/dev/null || true
+    for _ in $(seq 1 10); do
+      kill -0 "$LOGS_PID" 2>/dev/null || break
+      sleep 0.2
+    done
+    pkill -KILL -P "$LOGS_PID" 2>/dev/null || true
+    kill -KILL "$LOGS_PID" 2>/dev/null || true
     wait "$LOGS_PID" 2>/dev/null || true
     LOGS_PID=""
   fi

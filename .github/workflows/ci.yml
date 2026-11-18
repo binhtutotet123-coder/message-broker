@@ -79,8 +79,10 @@ jobs:
       - name: Two-agent demo (scripts/demo-agents.sh, DEMO.md)
         run: |
           ./scripts/demo-agents.sh start 2>&1 | tee agents-start.log
+          # Chạy trong terminal giả lập (script) như khi người dùng gõ qua SSH; quá 90 giây là treo.
           for scenario in ask retry offline; do
-            ./scripts/demo-agents.sh "$scenario" 2>&1 | tee "agents-$scenario.log"
+            timeout 90 script -qec "./scripts/demo-agents.sh $scenario" /dev/null 2>&1 | tee "agents-$scenario.log" \
+              || { echo "$scenario: failed or hung (exit ${PIPESTATUS[0]})" | tee -a agents-check.log; exit 1; }
           done
           check() { grep -q "$2" "agents-$1.log" || { echo "$1: missing '$2'" | tee -a agents-check.log; exit 1; }; }
           for scenario in ask retry offline; do check "$scenario" 'Hoàn tất: dieu_phoi'; done
@@ -88,6 +90,10 @@ jobs:
           check retry 'đang xử lý dở'
           check offline 'Delivery attempt failed'
           check offline '\[tin_tuc\] nhận REQUEST'
+          # Dòng "gửi REQUEST" phải hiện trước log broker nhận tin.
+          sent=$(grep -n 'gửi REQUEST' agents-ask.log | head -1 | cut -d: -f1)
+          accepted=$(grep -n 'Accepted message' agents-ask.log | head -1 | cut -d: -f1)
+          [ "$sent" -lt "$accepted" ] || { echo "ask: 'gửi REQUEST' (line $sent) after 'Accepted' (line $accepted)" | tee -a agents-check.log; exit 1; }
           echo "::notice title=Agent demo::ask, retry, offline OK; tin_tuc ACK sau $(grep -o 'from tin_tuc .*after [0-9]* attempt' agents-*.log | grep -o '[0-9]* attempt' | tr '\n' ' ')"
       - name: Collect container logs
         if: failure()
