@@ -168,6 +168,8 @@ func (s *apiServer) handleAck(w http.ResponseWriter, r *http.Request, pathMessag
 		writeError(w, http.StatusInternalServerError, 500, "Could not update message")
 		return
 	}
+	log.Printf("[Broker][%s] ACK %s from %s for message %s; status now %s after %d attempt(s)",
+		snapshot.TraceID, request.Status, request.AgentID, snapshot.MessageID, snapshot.Status, snapshot.Attempts)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

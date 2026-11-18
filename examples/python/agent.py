@@ -70,6 +70,8 @@ def ack(message_id, outcome, trace_id=None):
     status, body = post_json(url, {"agent_id": AGENT_ID, "status": outcome}, trace_id)
     if status != 200:
         print("ACK %s lỗi HTTP %s: %s" % (message_id, status, body))
+    else:
+        print("[%s] đã gửi ACK %s cho tin %s" % (AGENT_ID, outcome, message_id))
 
 
 def handle(envelope, trace_id):
@@ -131,9 +133,11 @@ class Webhook(BaseHTTPRequestHandler):
         if state is None:
             threading.Thread(target=process, args=(envelope, trace_id), daemon=True).start()
         elif state == "done":
-            print("Tin trùng %s: bỏ qua, ACK lại" % message_id)
+            print("[%s] tin trùng %s (đã xử lý xong): bỏ qua, ACK lại" % (AGENT_ID, message_id))
             threading.Thread(target=ack, args=(message_id, "success", trace_id), daemon=True).start()
-        # state == "processing": đang xử lý, luồng kia sẽ tự ACK.
+        else:
+            # Đang xử lý dở: luồng kia sẽ tự ACK khi xong.
+            print("[%s] tin trùng %s (đang xử lý dở): bỏ qua, sẽ ACK khi xong" % (AGENT_ID, message_id))
 
     def log_message(self, *args):
         pass

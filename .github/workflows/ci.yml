@@ -76,6 +76,19 @@ jobs:
           for i in $(seq 1 20); do docker compose logs test-agent 2>&1 | grep -q 'processed message smoke-ci' && break; sleep 1; done
           docker compose logs test-agent 2>&1 | grep 'processed message smoke-ci' | tee -a smoke.log
           echo "::notice title=Server config::broker healthy, /admin/fault=404, port 8081 closed, smoke-ci delivered to test-agent"
+      - name: Two-agent demo (scripts/demo-agents.sh, DEMO.md)
+        run: |
+          ./scripts/demo-agents.sh start 2>&1 | tee agents-start.log
+          for scenario in ask retry offline; do
+            ./scripts/demo-agents.sh "$scenario" 2>&1 | tee "agents-$scenario.log"
+          done
+          check() { grep -q "$2" "agents-$1.log" || { echo "$1: missing '$2'" | tee -a agents-check.log; exit 1; }; }
+          for scenario in ask retry offline; do check "$scenario" 'Hoàn tất: dieu_phoi'; done
+          check retry 'No ACK yet'
+          check retry 'đang xử lý dở'
+          check offline 'Delivery attempt failed'
+          check offline '\[tin_tuc\] nhận REQUEST'
+          echo "::notice title=Agent demo::ask, retry, offline OK; tin_tuc ACK sau $(grep -o 'from tin_tuc .*after [0-9]* attempt' agents-*.log | grep -o '[0-9]* attempt' | tr '\n' ' ')"
       - name: Collect container logs
         if: failure()
         run: docker compose logs --no-color > compose.log 2>&1 || true
