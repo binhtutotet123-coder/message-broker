@@ -156,6 +156,10 @@ func (b *Broker) dispatchDue(ctx context.Context) {
 			return
 		}
 
+		if candidate.Attempts > 1 {
+			log.Printf("[Broker][%s] No ACK yet for message %s: resending to %s (attempt %d)",
+				candidate.TraceID, candidate.Envelope.MessageID, candidate.Envelope.To, candidate.Attempts)
+		}
 		attemptCtx, cancel := context.WithTimeout(ctx, deliveryAttemptTimeout)
 		attemptStartedAt := time.Now()
 		err := b.deliver(attemptCtx, candidate.Envelope, candidate.TraceID)

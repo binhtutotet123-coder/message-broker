@@ -23,7 +23,7 @@ services:
     environment:
       BROKER_ADDR: ":8080"
       RETRY_INTERVAL: "${RETRY_INTERVAL:-5s}"
-      AGENT_ROUTES: "${AGENT_ROUTES:-agent_B=http://test-agent:8081/webhook/receive}"
+      AGENT_ROUTES: "${AGENT_ROUTES:-agent_B=http://test-agent:8081/webhook/receive,dieu_phoi=http://demo-dieu-phoi:9101/webhook/receive,tin_tuc=http://demo-tin-tuc:9102/webhook/receive}"
       REGISTRY_LOOKUP_URL: "${REGISTRY_LOOKUP_URL:-}"
       REGISTRY_CACHE_TTL: "${REGISTRY_CACHE_TTL:-30s}"
       FAULT_INJECTION: "false"
@@ -45,3 +45,37 @@ services:
     depends_on:
       broker:
         condition: service_healthy
+
+  # Hai agent Python mẫu (examples/python/demo_agents.py) nói chuyện với nhau qua broker.
+  # Chỉ chạy khi bật profile demo: ./scripts/demo-agents.sh start (xem DEMO.md).
+  # Không mở cổng ra ngoài: broker gọi webhook của chúng qua mạng nội bộ Docker.
+  demo-dieu-phoi: &demo-agent
+    image: python:3.12-alpine
+    profiles: ["demo"]
+    restart: unless-stopped
+    init: true  # để "docker compose stop" tắt agent ngay, không phải chờ 10 giây
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    working_dir: /app
+    volumes:
+      - ./examples/python:/app:ro
+    command: ["python", "-u", "demo_agents.py", "serve"]
+    environment:
+      AGENT_ID: "dieu_phoi"
+      PORT: "9101"
+      BROKER_URL: "http://broker:8080"
+      PYTHONDONTWRITEBYTECODE: "1"
+    depends_on:
+      broker:
+        condition: service_healthy
+
+  demo-tin-tuc:
+    <<: *demo-agent
+    environment:
+      AGENT_ID: "tin_tuc"
+      PORT: "9102"
+      BROKER_URL: "http://broker:8080"
+      PYTHONDONTWRITEBYTECODE: "1"
