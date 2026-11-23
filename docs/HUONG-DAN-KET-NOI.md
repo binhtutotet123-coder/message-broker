@@ -30,12 +30,16 @@ Muốn nhanh: dùng agent mẫu [`examples/python/agent.py`](../examples/python/
 - **Agent kéo tin về (`GET /receive`)**: không cần đăng ký gì với Team 2. Khi agent đang kéo tin, broker
   đã biết agent đó và nhận tin gửi cho nó. Muốn agent khác gửi được tin cho bạn cả lúc agent của bạn
   chưa chạy, nhắn Team 2 `agent_id` để thêm vào bảng định tuyến dưới dạng `team_08_news=pull`.
+  Nếu đăng ký ở Service Registry của Team 1 (ô `endpoint` bắt buộc phải điền), ghi `endpoint` là
+  **`https://pull.invalid`**: broker hiểu là agent tự kéo tin, không gọi webhook mà giữ tin chờ agent
+  kéo về. (`.invalid` là tên miền dành riêng, không bao giờ tồn tại.)
 - **Agent nhận qua webhook**: gửi cho Team 2 `agent_id` và **URL webhook**, ví dụ
   `http://1.2.3.4:9000/webhook/receive`. Server `103.81.84.102` phải **gọi tới được** địa chỉ này:
   dùng IP public hoặc tên miền, không dùng `localhost` hay IP mạng nhà/wifi trường.
 
 Broker cũng tra địa chỉ trong Service Registry của Team 1 (`GET /v1/agents/{agent_id}`, trường
-`endpoint`); agent có trạng thái `UNREGISTERED` ở đó được coi là không tồn tại.
+`endpoint`); agent có trạng thái `UNREGISTERED` ở đó được coi là không tồn tại, còn agent có
+`endpoint` là `https://pull.invalid` được coi là agent tự kéo tin.
 
 ## 2. Định dạng tin nhắn
 

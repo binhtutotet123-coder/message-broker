@@ -45,6 +45,10 @@ var (
 	ErrInvalidMessageID = errors.New("message_id is required")
 	// ErrInvalidAckStatus indicates the ACK outcome is unsupported.
 	ErrInvalidAckStatus = errors.New("ACK status must be success or failed")
+	// ErrPullOnly is returned (wrapped) by a DeliveryFunc when the recipient has no
+	// webhook, for example it registered https://pull.invalid in the Service Registry.
+	// The worker then leaves its messages for GET /receive instead of retrying.
+	ErrPullOnly = errors.New("recipient has no webhook and fetches its messages with GET /receive")
 )
 
 // DeliveryFunc sends an envelope to its recipient and reports transport failures.
@@ -77,6 +81,8 @@ type Broker struct {
 	pullMu     sync.Mutex
 	staticPull map[string]bool      // agents configured as pull-only
 	lastPoll   map[string]time.Time // agent ID -> time of its latest Receive call
+	noWebhook  map[string]time.Time // agent ID -> until when delivery reported ErrPullOnly
+	announced  map[string]bool      // agents whose missing webhook was already logged
 }
 
 // New creates an in-memory broker with a delivery callback and retry interval.
@@ -103,6 +109,8 @@ func NewWithStore(deliver DeliveryFunc, retryInterval time.Duration, store Messa
 		pullWindow:    defaultPullWindow,
 		staticPull:    make(map[string]bool),
 		lastPoll:      make(map[string]time.Time),
+		noWebhook:     make(map[string]time.Time),
+		announced:     make(map[string]bool),
 	}, nil
 }
 
@@ -124,7 +132,7 @@ func (b *Broker) IsPulling(agentID string) bool {
 }
 
 func (b *Broker) isPullingLocked(agentID string, now time.Time) bool {
-	if b.staticPull[agentID] {
+	if b.staticPull[agentID] || now.Before(b.noWebhook[agentID]) {
 		return true
 	}
 	last, ok := b.lastPoll[agentID]
@@ -145,7 +153,25 @@ func (b *Broker) pullingSnapshot(now time.Time) map[string]bool {
 			pulling[agentID] = true
 		}
 	}
+	for agentID, until := range b.noWebhook {
+		if now.Before(until) {
+			pulling[agentID] = true
+		}
+	}
 	return pulling
+}
+
+// noteNoWebhook stops webhook attempts to agentID for a pull window, after delivery
+// reported that it has no webhook, and logs this once per agent.
+func (b *Broker) noteNoWebhook(agentID, traceID string, now time.Time) {
+	b.pullMu.Lock()
+	defer b.pullMu.Unlock()
+	b.noWebhook[agentID] = now.Add(b.pullWindow)
+	if !b.announced[agentID] {
+		b.announced[agentID] = true
+		log.Printf("[Broker][%s] Agent %s has no webhook (route \"pull\" or endpoint https://pull.invalid): its messages wait at the broker for GET /receive",
+			traceID, agentID)
+	}
 }
 
 // notePoll records a Receive call and logs when an agent starts polling.
@@ -283,6 +309,14 @@ func (b *Broker) dispatchDue(ctx context.Context) {
 		attemptStartedAt := time.Now()
 		err := b.deliver(attemptCtx, candidate.Envelope, candidate.TraceID)
 		cancel()
+		if errors.Is(err, ErrPullOnly) {
+			// Nothing was sent: hand the message straight back for the agent to poll.
+			b.noteNoWebhook(candidate.Envelope.To, candidate.TraceID, time.Now())
+			if err := b.store.Unclaim(candidate.Envelope.MessageID, candidate.LeaseToken); err != nil {
+				log.Printf("Unclaim message %s: %v", candidate.Envelope.MessageID, err)
+			}
+			continue
+		}
 		b.finishAttempt(candidate.Envelope.MessageID, candidate.LeaseToken, attemptStartedAt.Add(b.retryInterval))
 		if err != nil {
 			log.Printf("[Broker][%s] Delivery attempt failed for message %s: %v", candidate.TraceID, candidate.Envelope.MessageID, err)

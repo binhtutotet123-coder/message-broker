@@ -216,3 +216,46 @@ func TestHTTPResolverHonoursRegistryStatus(t *testing.T) {
 		}
 	}
 }
+
+// TestPullEndpointConvention covers agents that register https://pull.invalid because
+// the Registry's Agent Card requires an endpoint and they have no webhook.
+func TestPullEndpointConvention(t *testing.T) {
+	for route, want := range map[string]bool{
+		"pull":                             true,
+		PullEndpoint:                       true,
+		"http://PULL.invalid/anything":     true,
+		"https://example.com/hook":         false,
+		"https://pull.invalid.example.org": false,
+	} {
+		if got := IsPullRoute(route); got != want {
+			t.Errorf("IsPullRoute(%q) = %t, want %t", route, got, want)
+		}
+	}
+
+	static, err := NewStaticResolver(map[string]string{"laptop": PullEndpoint})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := static.Resolve(context.Background(), "laptop"); !errors.Is(err, ErrPullOnly) {
+		t.Fatalf("static pull endpoint error = %v, want ErrPullOnly", err)
+	}
+
+	var hits atomic.Int32
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Write([]byte(`{"agent_id":"laptop","endpoint":"https://pull.invalid","status":"ONLINE"}`))
+	}))
+	defer registry.Close()
+	resolver, err := NewHTTPResolver(registry.URL+"/v1/agents/{agent_id}", registry.Client(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := resolver.Resolve(context.Background(), "laptop"); !errors.Is(err, ErrPullOnly) {
+			t.Fatalf("registry pull endpoint error = %v, want ErrPullOnly", err)
+		}
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("registry hits = %d, want 1 (pull answers are cached too)", got)
+	}
+}

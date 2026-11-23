@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -178,5 +179,38 @@ func TestStaticPullAgentsAreNeverPushed(t *testing.T) {
 	}
 	if got, _ := messageBroker.Receive(context.Background(), "laptop", 10, 0); len(got) != 1 {
 		t.Fatalf("static pull agent poll = %+v, want its message", got)
+	}
+}
+
+// TestWorkerLeavesNoWebhookRecipientsForReceive covers a registry agent whose endpoint
+// is https://pull.invalid: no retry storm, no counted attempt, message ready to poll.
+func TestWorkerLeavesNoWebhookRecipientsForReceive(t *testing.T) {
+	var calls atomic.Int32
+	messageBroker, err := New(func(context.Context, models.MessageEnvelope, string) error {
+		calls.Add(1)
+		return fmt.Errorf("%w: registry endpoint is https://pull.invalid", ErrPullOnly)
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, _, err := messageBroker.Accept(pullEnvelope("np-1", "registry_laptop"), "trace"); err != nil {
+		t.Fatal(err)
+	}
+
+	messageBroker.dispatchDue(ctx)
+	messageBroker.dispatchDue(ctx)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("delivery calls = %d, want 1 (then the agent is left for GET /receive)", got)
+	}
+	if snapshot, _, _ := messageBroker.Get("np-1"); snapshot.Attempts != 0 || snapshot.Status != StatusPending {
+		t.Fatalf("after no-webhook attempt: %+v, want Pending with 0 attempts", snapshot)
+	}
+	if !messageBroker.IsPulling("registry_laptop") {
+		t.Fatal("agent without webhook is not treated as pulling")
+	}
+	got, err := messageBroker.Receive(ctx, "registry_laptop", 10, 0)
+	if err != nil || len(got) != 1 || got[0].Attempts != 1 {
+		t.Fatalf("poll = (%+v, %v), want np-1 right away as attempt 1", got, err)
 	}
 }

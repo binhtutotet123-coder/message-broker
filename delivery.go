@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 
+	"message-broker/broker"
 	"message-broker/models"
 	"message-broker/routing"
 )
@@ -23,6 +25,10 @@ type webhookDelivery struct {
 // It implements broker.DeliveryFunc; any error makes the broker retry later.
 func (d webhookDelivery) deliver(ctx context.Context, envelope models.MessageEnvelope, traceID string) error {
 	target, err := d.resolver.Resolve(ctx, envelope.To)
+	if errors.Is(err, routing.ErrPullOnly) {
+		// No webhook to call: the broker keeps the message for GET /receive.
+		return fmt.Errorf("%w: %v", broker.ErrPullOnly, err)
+	}
 	if err != nil {
 		return fmt.Errorf("resolve recipient %q: %w", envelope.To, err)
 	}
