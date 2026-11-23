@@ -399,15 +399,15 @@ func TestMemoryStoreReclaimsExpiredLease(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, found, err := store.ClaimDue(now, now.Add(5*time.Second), "worker-a-token")
+	first, found, err := store.ClaimDue(now, now.Add(5*time.Second), "worker-a-token", nil)
 	if err != nil || !found || first.Attempts != 1 {
 		t.Fatalf("first claim = (%+v, %t, %v), want attempt 1", first, found, err)
 	}
-	if _, found, err := store.ClaimDue(now.Add(time.Second), now.Add(6*time.Second), "worker-b-token"); err != nil || found {
+	if _, found, err := store.ClaimDue(now.Add(time.Second), now.Add(6*time.Second), "worker-b-token", nil); err != nil || found {
 		t.Fatalf("claim before lease expiry = (found=%t, err=%v), want no claim", found, err)
 	}
 
-	reclaimed, found, err := store.ClaimDue(now.Add(6*time.Second), now.Add(11*time.Second), "worker-b-token")
+	reclaimed, found, err := store.ClaimDue(now.Add(6*time.Second), now.Add(11*time.Second), "worker-b-token", nil)
 	if err != nil || !found || reclaimed.Attempts != 2 {
 		t.Fatalf("claim after lease expiry = (%+v, %t, %v), want attempt 2", reclaimed, found, err)
 	}

@@ -46,21 +46,30 @@ broker với `REGISTRY_LOOKUP_URL='http://localhost:8082/agents/{agent_id}'`.
 |-----------------------|-------------------------------------------------|---------|
 | `BROKER_ADDR`         | `:8080`                                         | Địa chỉ lắng nghe |
 | `RETRY_INTERVAL`      | `5s`                                            | Chờ ACK bao lâu trước khi gửi lại |
-| `AGENT_ROUTES`        | `agent_B=http://localhost:8081/webhook/receive` | Bảng định tuyến tĩnh `id=url,id=url`; đặt rỗng để chỉ dùng registry |
+| `AGENT_ROUTES`        | `agent_B=http://localhost:8081/webhook/receive` | Bảng định tuyến tĩnh `id=url,id=url`; `id=pull` cho agent chỉ kéo tin; đặt rỗng để chỉ dùng registry |
 | `REGISTRY_LOOKUP_URL` | (trống)                                         | URL tra cứu registry, phải chứa `{agent_id}` |
 | `REGISTRY_CACHE_TTL`  | `30s`                                           | Thời gian cache kết quả registry (`0s` = không cache) |
 | `FAULT_INJECTION`     | `false`                                         | Bật API `/admin/fault` |
 
 ## Định tuyến
 
-Broker gửi mỗi tin tới webhook của agent ghi trong trường `to`. Thứ tự tra cứu:
-`AGENT_ROUTES` trước, sau đó tới Service Registry. Nếu không tìm thấy agent (hoặc
-registry đang lỗi), tin vẫn ở trạng thái `Pending` và được thử lại sau `RETRY_INTERVAL`.
+Người nhận (trường `to`) lấy tin theo một trong hai cách:
 
-**Giả định về API của Team 1 (cần xác nhận):** `GET {REGISTRY_LOOKUP_URL}` trả về
-`200 {"webhook_url": "http://..."}` (chấp nhận cả trường `endpoint` hoặc `url`), hoặc `404`
-nếu agent chưa đăng ký. Nếu Team 1 dùng định dạng khác, chỉ cần sửa `parseRegistryResponse`
-trong [`routing/resolver.go`](routing/resolver.go).
+- **Kéo về (`GET /receive?agent_id=..&wait=20`)**: agent tự hỏi broker, không cần IP public. Trong lúc
+  agent đang kéo tin (và 60 giây sau lần kéo cuối), worker không gọi webhook của agent đó. Tin kéo về
+  vẫn phải ACK; chưa ACK thì sau `RETRY_INTERVAL` tin lại nằm trong lần kéo tiếp theo.
+- **Webhook**: broker tra địa chỉ theo thứ tự `AGENT_ROUTES` trước, sau đó tới Service Registry, rồi
+  POST tin tới đó và thử lại sau `RETRY_INTERVAL` cho tới khi có ACK.
+
+`POST /send` trả `404` nếu người nhận không có ở đâu cả: không có trong `AGENT_ROUTES`, không có trong
+Registry (hoặc Registry ghi `status: UNREGISTERED`), và không đang kéo tin. Nếu Registry đang lỗi,
+broker vẫn nhận tin (`202`) và thử lại sau.
+
+**API của Team 1 (Agent Registry, [HPHind110/agent-registry](https://github.com/HPHind110/agent-registry)):**
+đặt `REGISTRY_LOOKUP_URL=http://<registry>:8000/v1/agents/{agent_id}`. Broker đọc trường `endpoint`
+(ưu tiên `webhook_url` nếu có) và `status`; `404` hoặc `UNREGISTERED` nghĩa là agent không tồn tại.
+Nếu Team 1 đổi định dạng, chỉ cần sửa `parseRegistryResponse` trong
+[`routing/resolver.go`](routing/resolver.go).
 
 ## Fault Injection (kiểm thử ACK và Retry)
 
@@ -93,6 +102,8 @@ lần. Bản tự động của kịch bản này là test `TestFaultInjectionEv
 
 ## Lưu ý cho các team Agent
 
+- Agent không có IP public (chạy trên laptop) nhận tin bằng `GET /receive`; agent mẫu
+  [`examples/python/agent.py`](examples/python/agent.py) có sẵn lệnh `poll`.
 - Sau khi xử lý xong tin, **bắt buộc** gọi `POST /messages/{message_id}/ack`; nếu không,
   broker sẽ gửi lại tin.
 - Broker đảm bảo giao **ít nhất một lần**, nên agent có thể nhận cùng một tin nhiều lần.

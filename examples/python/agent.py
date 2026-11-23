@@ -1,7 +1,10 @@
 """Agent mẫu kết nối Message Broker (Team 2). Chỉ dùng thư viện chuẩn, cần Python 3.8+.
 
 Cách dùng:
-    python agent.py serve                 chạy webhook nhận tin tại http://0.0.0.0:<PORT>/webhook/receive
+    python agent.py poll                  nhận tin bằng cách kéo về (GET /receive): không cần IP public,
+                                          chạy được trên laptop ở nhà, ở trường
+    python agent.py serve                 nhận tin qua webhook tại http://0.0.0.0:<PORT>/webhook/receive
+                                          (máy phải có địa chỉ mà server broker gọi tới được)
     python agent.py send <to> [nội dung]  gửi một tin type=request tới agent <to>
 
 Biến môi trường:
@@ -10,13 +13,14 @@ Biến môi trường:
     PORT        cổng webhook khi chạy serve (mặc định 9000)
 
 Sửa hàm handle() để đưa logic của agent vào. Phần còn lại lo việc nhận tin,
-lọc tin trùng và gửi ACK đúng cách.
+lọc tin trùng và gửi ACK đúng cách, giống nhau cho cả poll và serve.
 """
 
 import json
 import os
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 BROKER_URL = os.environ.get("BROKER_URL", "http://103.81.84.102:8080").rstrip("/")
 AGENT_ID = os.environ.get("AGENT_ID", "team_xx_agent")
 PORT = int(os.environ.get("PORT", "9000"))
+POLL_WAIT = 20  # giây: broker giữ lệnh GET /receive tối đa chừng này để chờ tin mới
 
 
 def post_json(url, body, trace_id=None):
@@ -107,6 +112,23 @@ def process(envelope, trace_id):
     ack(message_id, "success", trace_id)
 
 
+def on_message(envelope, trace_id):
+    """Nhận một tin (qua webhook hoặc kéo về): lọc trùng, rồi xử lý và ACK ở luồng riêng."""
+    message_id = envelope["message_id"]
+    with states_lock:
+        state = states.get(message_id)
+        if state is None:
+            states[message_id] = "processing"
+    if state is None:
+        threading.Thread(target=process, args=(envelope, trace_id), daemon=True).start()
+    elif state == "done":
+        print("[%s] tin trùng %s (đã xử lý xong): bỏ qua, ACK lại" % (AGENT_ID, message_id))
+        threading.Thread(target=ack, args=(message_id, "success", trace_id), daemon=True).start()
+    else:
+        # Đang xử lý dở: luồng kia sẽ tự ACK khi xong.
+        print("[%s] tin trùng %s (đang xử lý dở): bỏ qua, sẽ ACK khi xong" % (AGENT_ID, message_id))
+
+
 class Webhook(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path != "/webhook/receive":
@@ -114,42 +136,55 @@ class Webhook(BaseHTTPRequestHandler):
             return
         try:
             envelope = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-            message_id = envelope["message_id"]
+            envelope["message_id"]
         except (ValueError, KeyError):
             self.send_error(400, "invalid message")
             return
-        trace_id = self.headers.get("X-Trace-Id")
 
         # Trả 200 ngay (trong 5 giây) để báo "đã nhận"; xử lý và ACK ở luồng riêng.
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(b'{"status":"received"}')
-
-        with states_lock:
-            state = states.get(message_id)
-            if state is None:
-                states[message_id] = "processing"
-        if state is None:
-            threading.Thread(target=process, args=(envelope, trace_id), daemon=True).start()
-        elif state == "done":
-            print("[%s] tin trùng %s (đã xử lý xong): bỏ qua, ACK lại" % (AGENT_ID, message_id))
-            threading.Thread(target=ack, args=(message_id, "success", trace_id), daemon=True).start()
-        else:
-            # Đang xử lý dở: luồng kia sẽ tự ACK khi xong.
-            print("[%s] tin trùng %s (đang xử lý dở): bỏ qua, sẽ ACK khi xong" % (AGENT_ID, message_id))
+        on_message(envelope, self.headers.get("X-Trace-Id"))
 
     def log_message(self, *args):
         pass
 
 
+def poll_forever():
+    """Kéo tin về bằng GET /receive. Chỉ cần gọi ra ngoài, nên không cần IP public.
+
+    Broker giữ lệnh gọi tối đa POLL_WAIT giây để chờ tin mới, nên tin tới gần như ngay.
+    Tin kéo về vẫn phải ACK; chưa ACK thì lần kéo sau (sau RETRY_INTERVAL) sẽ nhận lại.
+    """
+    query = urllib.parse.urlencode({"agent_id": AGENT_ID, "wait": POLL_WAIT, "limit": 10})
+    url = "%s/receive?%s" % (BROKER_URL, query)
+    print("Agent %s kéo tin từ broker %s (không cần webhook hay IP public)" % (AGENT_ID, BROKER_URL))
+    while True:
+        try:
+            with urllib.request.urlopen(url, timeout=POLL_WAIT + 10) as response:
+                messages = json.loads(response.read() or b"[]")
+        except Exception as error:  # mất mạng, broker khởi động lại...: chờ rồi thử lại
+            print("[%s] kéo tin lỗi: %s; thử lại sau 3 giây" % (AGENT_ID, error))
+            time.sleep(3)
+            continue
+        for envelope in messages:
+            on_message(envelope, envelope.pop("trace_id", None))
+
+
 def main():
-    if len(sys.argv) >= 2 and sys.argv[1] == "serve":
+    if len(sys.argv) >= 2 and sys.argv[1] == "poll":
+        poll_forever()
+    elif len(sys.argv) >= 2 and sys.argv[1] == "serve":
         print("Agent %s nhận tin tại http://0.0.0.0:%d/webhook/receive (broker %s)" % (AGENT_ID, PORT, BROKER_URL))
         ThreadingHTTPServer(("0.0.0.0", PORT), Webhook).serve_forever()
     elif len(sys.argv) >= 3 and sys.argv[1] == "send":
         text = " ".join(sys.argv[3:]) or "xin chào"
-        result = send_message(sys.argv[2], {"text": text})
+        try:
+            result = send_message(sys.argv[2], {"text": text})
+        except (RuntimeError, OSError) as error:
+            sys.exit("Gửi thất bại: %s" % error)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         print(__doc__)

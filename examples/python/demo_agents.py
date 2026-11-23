@@ -6,6 +6,7 @@ Vai trò chọn bằng AGENT_ID:
 
 Cách dùng:
     python demo_agents.py serve                         chạy webhook của agent (theo AGENT_ID)
+    python demo_agents.py poll                          như serve nhưng kéo tin về (GET /receive)
     python demo_agents.py ask [--delay N] [câu hỏi]     dieu_phoi gửi request tới tin_tuc
 
 --delay N: nhờ tin_tuc "xử lý" N giây (mặc định DEMO_DELAY, 2 giây). Đặt N lớn hơn

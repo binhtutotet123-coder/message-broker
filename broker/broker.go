@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"message-broker/models"
@@ -31,6 +32,12 @@ const (
 	workerPollInterval     = 100 * time.Millisecond
 	deliveryAttemptTimeout = 5 * time.Second
 	deliveryLeaseGrace     = 2 * workerPollInterval
+
+	// defaultPullWindow is how long after its last GET /receive an agent still counts
+	// as polling: the worker does not push webhooks to it during that time.
+	defaultPullWindow = 60 * time.Second
+	// receivePollInterval is how often a waiting GET /receive checks for new messages.
+	receivePollInterval = 100 * time.Millisecond
 )
 
 var (
@@ -52,11 +59,24 @@ type Snapshot struct {
 	Attempts  int
 }
 
-// Broker tracks message state and schedules webhook delivery attempts.
+// Pulled is one message handed to a polling agent by Receive.
+type Pulled struct {
+	Envelope models.MessageEnvelope
+	TraceID  string
+	Attempts int
+}
+
+// Broker tracks message state and schedules webhook delivery attempts. Agents
+// without a reachable webhook fetch their messages with Receive instead.
 type Broker struct {
 	store         MessageStore
 	deliver       DeliveryFunc
 	retryInterval time.Duration
+
+	pullWindow time.Duration
+	pullMu     sync.Mutex
+	staticPull map[string]bool      // agents configured as pull-only
+	lastPoll   map[string]time.Time // agent ID -> time of its latest Receive call
 }
 
 // New creates an in-memory broker with a delivery callback and retry interval.
@@ -80,7 +100,106 @@ func NewWithStore(deliver DeliveryFunc, retryInterval time.Duration, store Messa
 		store:         store,
 		deliver:       deliver,
 		retryInterval: retryInterval,
+		pullWindow:    defaultPullWindow,
+		staticPull:    make(map[string]bool),
+		lastPoll:      make(map[string]time.Time),
 	}, nil
+}
+
+// MarkPullAgents records agents that never get webhooks and only use Receive.
+func (b *Broker) MarkPullAgents(agentIDs ...string) {
+	b.pullMu.Lock()
+	defer b.pullMu.Unlock()
+	for _, agentID := range agentIDs {
+		b.staticPull[agentID] = true
+	}
+}
+
+// IsPulling reports whether agentID fetches its own messages: it is configured as
+// pull-only or called Receive within the pull window.
+func (b *Broker) IsPulling(agentID string) bool {
+	b.pullMu.Lock()
+	defer b.pullMu.Unlock()
+	return b.isPullingLocked(agentID, time.Now())
+}
+
+func (b *Broker) isPullingLocked(agentID string, now time.Time) bool {
+	if b.staticPull[agentID] {
+		return true
+	}
+	last, ok := b.lastPoll[agentID]
+	return ok && now.Sub(last) < b.pullWindow
+}
+
+// pullingSnapshot copies the set of agents that currently fetch their own messages,
+// so the worker can skip them without holding pullMu inside the store.
+func (b *Broker) pullingSnapshot(now time.Time) map[string]bool {
+	b.pullMu.Lock()
+	defer b.pullMu.Unlock()
+	pulling := make(map[string]bool, len(b.staticPull)+len(b.lastPoll))
+	for agentID := range b.staticPull {
+		pulling[agentID] = true
+	}
+	for agentID, last := range b.lastPoll {
+		if now.Sub(last) < b.pullWindow {
+			pulling[agentID] = true
+		}
+	}
+	return pulling
+}
+
+// notePoll records a Receive call and logs when an agent starts polling.
+func (b *Broker) notePoll(agentID string, now time.Time) {
+	b.pullMu.Lock()
+	defer b.pullMu.Unlock()
+	if !b.isPullingLocked(agentID, now) {
+		log.Printf("[Broker] Agent %s is polling GET /receive: its messages wait at the broker instead of being pushed to a webhook", agentID)
+	}
+	b.lastPoll[agentID] = now
+}
+
+// Receive hands up to limit due messages for agentID to the agent itself (GET /receive).
+// With no message due it waits up to wait for one, returning early if ctx ends. Each
+// handed message is due again after the retry interval unless the agent ACKs it, so a
+// lost response or a crash after polling only delays the message.
+func (b *Broker) Receive(ctx context.Context, agentID string, limit int, wait time.Duration) ([]Pulled, error) {
+	if limit <= 0 {
+		return nil, errors.New("limit must be positive")
+	}
+	deadline := time.Now().Add(wait)
+	defer func() { b.notePoll(agentID, time.Now()) }()
+
+	for {
+		now := time.Now()
+		b.notePoll(agentID, now)
+		records, err := b.store.ClaimDueFor(agentID, now, now.Add(b.retryInterval), limit)
+		if err != nil {
+			return nil, err
+		}
+		if len(records) > 0 {
+			pulled := make([]Pulled, 0, len(records))
+			for _, record := range records {
+				if record.Attempts > 1 {
+					log.Printf("[Broker][%s] No ACK yet for message %s: handing it to %s again via GET /receive (attempt %d)",
+						record.TraceID, record.Envelope.MessageID, agentID, record.Attempts)
+				}
+				log.Printf("[Broker][%s] Agent %s pulled message %s via GET /receive; waiting for ACK",
+					record.TraceID, agentID, record.Envelope.MessageID)
+				pulled = append(pulled, Pulled{Envelope: record.Envelope, TraceID: record.TraceID, Attempts: record.Attempts})
+			}
+			return pulled, nil
+		}
+		if !now.Before(deadline) {
+			return []Pulled{}, nil
+		}
+		timer := time.NewTimer(receivePollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return []Pulled{}, nil
+		case <-timer.C:
+		}
+	}
 }
 
 // Accept records an envelope once and reports whether the ID was already accepted.
@@ -171,7 +290,8 @@ func (b *Broker) dispatchDue(ctx context.Context) {
 	}
 }
 
-// claimDue marks the earliest eligible pending message as in flight.
+// claimDue marks the earliest eligible pending message as in flight. Messages for
+// agents that poll GET /receive are left for them.
 func (b *Broker) claimDue(now time.Time) (MessageRecord, bool) {
 	tokenBytes := make([]byte, 16)
 	if _, err := rand.Read(tokenBytes); err != nil {
@@ -180,7 +300,10 @@ func (b *Broker) claimDue(now time.Time) (MessageRecord, bool) {
 	}
 	leaseToken := hex.EncodeToString(tokenBytes)
 	leaseUntil := now.Add(deliveryAttemptTimeout + deliveryLeaseGrace)
-	record, found, err := b.store.ClaimDue(now, leaseUntil, leaseToken)
+	pulling := b.pullingSnapshot(now)
+	record, found, err := b.store.ClaimDue(now, leaseUntil, leaseToken, func(recipient string) bool {
+		return pulling[recipient]
+	})
 	if err != nil {
 		log.Printf("Claim due message from store: %v", err)
 		return MessageRecord{}, false

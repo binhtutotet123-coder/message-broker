@@ -6,7 +6,7 @@ info:
     Hệ thống hỗ trợ cả 2 cơ chế nhận tin nhắn cho Agent đích:
     1. **Cơ chế PUSH (Webhook):** Broker chủ động đẩy tin nhắn thẳng vào endpoint `/webhook/receive` của Agent đích (Khuyên dùng).
     2. **Cơ chế PULL (Polling):** Agent đích chủ động gọi API `GET /receive` của Broker để kéo tin nhắn về (Dùng khi Agent không có public endpoint hoặc bị rớt mạng).
-  version: 1.1.0
+  version: 1.2.0
 servers:
   - url: http://localhost:8080
     description: Broker Local Server
@@ -33,18 +33,38 @@ paths:
               $ref: '#/components/schemas/MessageEnvelope'
       responses:
         '202':
-          description: Accepted - Broker đã nhận, lưu DB thành công (Pending) và sẽ đảm bảo giao hàng.
+          description: |
+            Accepted - Broker đã nhận (Pending) và sẽ đảm bảo giao hàng, kể cả khi người nhận đang offline.
+            Gửi lại đúng tin cũ (cùng message_id, cùng nội dung) cũng trả 202, kèm "duplicate": true.
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: |
+            Người nhận (to) không tồn tại: không có trong bảng định tuyến, không có trong Service Registry
+            (hoặc Registry ghi status UNREGISTERED), và không đang kéo tin bằng GET /receive.
+            Nếu Registry tạm thời lỗi, broker không trả 404 mà nhận tin (202) và thử lại sau.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorModel'
+        '409':
+          description: message_id đã được dùng cho một tin khác nội dung.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorModel'
         '500':
           $ref: '#/components/responses/InternalServerError'
 
   /receive:
     get:
       summary: Agent kéo tin nhắn về (Cơ chế PULL)
-      description: Dành cho các Agent dùng cơ chế Pull. Gọi API này để lấy các tin nhắn đang có status PENDING dành cho mình.
+      description: |
+        Dành cho các Agent dùng cơ chế Pull (không cần IP public). Gọi API này để lấy các tin nhắn đang có status PENDING dành cho mình.
+        Mỗi tin trả về vẫn phải ACK qua /messages/{message_id}/ack. Chưa ACK thì sau RETRY_INTERVAL (5 giây) tin lại có trong lần gọi tiếp theo,
+        nên Agent phải lọc trùng theo message_id. Trong lúc một Agent đang gọi API này (và 60 giây sau lần gọi cuối), Broker không đẩy webhook tới Agent đó.
       security:
         - BearerAuth: []
       parameters:
@@ -60,16 +80,32 @@ paths:
           schema:
             type: integer
             default: 10
-          description: "Số lượng tin nhắn tối đa muốn lấy trong 1 lần."
+          description: "Số lượng tin nhắn tối đa muốn lấy trong 1 lần (1-100)."
+        - in: query
+          name: wait
+          required: false
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+            maximum: 30
+          description: "Long polling: nếu chưa có tin, Broker giữ request tối đa bấy nhiêu giây (tối đa 30) và trả về ngay khi có tin."
       responses:
         '200':
-          description: Trả về danh sách Message Envelope chưa được xử lý.
+          description: Trả về danh sách Message Envelope chưa được xử lý (mảng rỗng nếu không có tin). Mỗi phần tử có thêm trace_id.
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/MessageEnvelope'
+                  allOf:
+                    - $ref: '#/components/schemas/MessageEnvelope'
+                    - type: object
+                      properties:
+                        trace_id:
+                          type: string
+                          description: X-Trace-Id của tin; dùng lại làm X-Trace-Id khi trả lời.
+                          example: "trace-42"
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -116,6 +152,18 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: agent_id không phải người nhận (to) của tin này.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorModel'
+        '404':
+          description: Không có tin với message_id này.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorModel'
         '500':
           $ref: '#/components/responses/InternalServerError'
 

@@ -1,22 +1,42 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"message-broker/broker"
 	"message-broker/fault"
 	"message-broker/models"
+	"message-broker/routing"
+)
+
+const (
+	defaultReceiveLimit = 10
+	maxReceiveLimit     = 100
+	maxReceiveWait      = 30 * time.Second
 )
 
 type apiServer struct {
 	broker *broker.Broker
 	// faultInjector, when set, exposes /admin/fault for fault-injection tests.
 	faultInjector *fault.Injector
+	// checkRecipient, when set, makes /send reject recipients it reports as
+	// routing.ErrAgentNotFound. Other errors (a registry outage) do not block /send.
+	checkRecipient func(ctx context.Context, agentID string) error
+}
+
+// pulledMessage is one item of the GET /receive response: the envelope plus its trace ID.
+type pulledMessage struct {
+	models.MessageEnvelope
+	TraceID string `json:"trace_id"`
 }
 
 type ackRequest struct {
@@ -29,6 +49,7 @@ type ackRequest struct {
 func (s *apiServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/send", s.sendHandler)
+	mux.HandleFunc("/receive", s.receiveHandler)
 	mux.HandleFunc("/ack", s.ackHandler)
 	mux.HandleFunc("/messages/", s.messageAckHandler)
 	mux.HandleFunc("/healthz", healthHandler)
@@ -65,6 +86,9 @@ func (s *apiServer) sendHandler(w http.ResponseWriter, r *http.Request) {
 	if traceID == "" {
 		traceID = defaultTraceID
 	}
+	if s.rejectUnknownRecipient(w, r, envelope, traceID) {
+		return
+	}
 
 	snapshot, duplicate, err := s.broker.Accept(envelope, traceID)
 	switch {
@@ -92,6 +116,82 @@ func (s *apiServer) sendHandler(w http.ResponseWriter, r *http.Request) {
 		"message":         "Broker đã tiếp nhận và đang định tuyến",
 	}); err != nil {
 		log.Printf("Encode /send response: %v", err)
+	}
+}
+
+// rejectUnknownRecipient answers 404 and returns true when the recipient is not
+// registered anywhere. A resend of an already accepted message_id is never rejected,
+// so /send stays idempotent even if the recipient left in the meantime.
+func (s *apiServer) rejectUnknownRecipient(w http.ResponseWriter, r *http.Request, envelope models.MessageEnvelope, traceID string) bool {
+	if s.checkRecipient == nil {
+		return false
+	}
+	err := s.checkRecipient(r.Context(), envelope.To)
+	switch {
+	case err == nil:
+		return false
+	case !errors.Is(err, routing.ErrAgentNotFound):
+		log.Printf("[Broker][%s] Could not check recipient %s (%v); accepting message %s and retrying delivery later",
+			traceID, envelope.To, err, envelope.MessageID)
+		return false
+	}
+	if _, known, getErr := s.broker.Get(envelope.MessageID); getErr == nil && known {
+		return false
+	}
+	log.Printf("[Broker][%s] Rejected message %s: recipient %s is not registered", traceID, envelope.MessageID, envelope.To)
+	writeError(w, http.StatusNotFound, 404, fmt.Sprintf(
+		"recipient %q is not registered: it has no route in AGENT_ROUTES or the Service Registry and is not polling GET /receive",
+		envelope.To))
+	return true
+}
+
+// receiveHandler serves GET /receive?agent_id=..&limit=..&wait=.. for agents that fetch
+// their own messages (pull mode). It returns a JSON array of envelopes, each with its
+// trace_id; the agent must ACK every message exactly as with webhook delivery.
+func (s *apiServer) receiveHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	query := r.URL.Query()
+	agentID := query.Get("agent_id")
+	if message := validateIdentifier("agent_id", agentID); message != "" {
+		writeError(w, http.StatusBadRequest, 400, message)
+		return
+	}
+	limit := defaultReceiveLimit
+	if raw := query.Get("limit"); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 || value > maxReceiveLimit {
+			writeError(w, http.StatusBadRequest, 400, fmt.Sprintf("limit must be an integer from 1 to %d", maxReceiveLimit))
+			return
+		}
+		limit = value
+	}
+	var wait time.Duration
+	if raw := query.Get("wait"); raw != "" {
+		seconds, err := strconv.Atoi(raw)
+		if err != nil || seconds < 0 {
+			writeError(w, http.StatusBadRequest, 400, "wait must be a whole number of seconds, 0 or more")
+			return
+		}
+		wait = min(time.Duration(seconds)*time.Second, maxReceiveWait)
+	}
+
+	pulled, err := s.broker.Receive(r.Context(), agentID, limit, wait)
+	if err != nil {
+		log.Printf("Receive messages for %s: %v", agentID, err)
+		writeError(w, http.StatusInternalServerError, 500, "Could not read messages")
+		return
+	}
+	response := make([]pulledMessage, 0, len(pulled))
+	for _, message := range pulled {
+		response = append(response, pulledMessage{MessageEnvelope: message.Envelope, TraceID: message.TraceID})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Encode /receive response: %v", err)
 	}
 }
 

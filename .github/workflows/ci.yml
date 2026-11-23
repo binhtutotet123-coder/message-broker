@@ -95,6 +95,24 @@ jobs:
           accepted=$(grep -n 'Accepted message' agents-ask.log | head -1 | cut -d: -f1)
           [ "$sent" -lt "$accepted" ] || { echo "ask: 'gửi REQUEST' (line $sent) after 'Accepted' (line $accepted)" | tee -a agents-check.log; exit 1; }
           echo "::notice title=Agent demo::ask, retry, offline OK; tin_tuc ACK sau $(grep -o 'from tin_tuc .*after [0-9]* attempt' agents-*.log | grep -o '[0-9]* attempt' | tr '\n' ' ')"
+      - name: Laptop agent without a webhook (GET /receive, DEMO.md kịch bản 4)
+        run: |
+          # The runner plays the laptop: outside the Docker network, no route, it only calls the broker.
+          export BROKER_URL=http://127.0.0.1:8080 AGENT_ID=laptop_ci PYTHONDONTWRITEBYTECODE=1
+          python3 -u examples/python/agent.py poll > laptop.log 2>&1 &
+          poll_pid=$!
+          sleep 2
+          python3 examples/python/agent.py send tin_tuc "tin cong nghe" | tee laptop-send.log
+          for _ in $(seq 1 30); do grep -q 'đã gửi ACK success' laptop.log && break; sleep 1; done
+          kill "$poll_pid" || true
+          cat laptop.log
+          grep -q 'nhận response .* từ tin_tuc' laptop.log || { echo "laptop agent got no response from tin_tuc" | tee -a agents-check.log; exit 1; }
+          docker compose logs broker | grep -q 'Agent laptop_ci pulled message' || { echo "broker did not hand the reply over GET /receive" | tee -a agents-check.log; exit 1; }
+          if python3 examples/python/agent.py send khong_ton_tai "xin chao" > unknown.log 2>&1; then
+            echo "send to an unknown agent succeeded" | tee -a agents-check.log; exit 1
+          fi
+          grep -q 'HTTP 404' unknown.log || { cat unknown.log | tee -a agents-check.log; exit 1; }
+          echo "::notice title=Pull mode::laptop agent with no webhook got tin_tuc's answer via GET /receive; unknown recipient -> 404"
       - name: Collect container logs
         if: failure()
         run: docker compose logs --no-color > compose.log 2>&1 || true
