@@ -95,6 +95,13 @@ jobs:
           accepted=$(grep -n 'Accepted message' agents-ask.log | head -1 | cut -d: -f1)
           [ "$sent" -lt "$accepted" ] || { echo "ask: 'gửi REQUEST' (line $sent) after 'Accepted' (line $accepted)" | tee -a agents-check.log; exit 1; }
           echo "::notice title=Agent demo::ask, retry, offline OK; tin_tuc ACK sau $(grep -o 'from tin_tuc .*after [0-9]* attempt' agents-*.log | grep -o '[0-9]* attempt' | tr '\n' ' ')"
+      - name: Container network does not shadow 172.18.0.0/16 (Registry of Team 1)
+        run: |
+          subnet=$(docker network inspect message-broker_default --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}')
+          echo "message-broker_default subnet: $subnet"
+          [ "$subnet" = "10.213.0.0/24" ] || { echo "unexpected subnet $subnet" | tee -a agents-check.log; exit 1; }
+          ip route get 172.18.97.242 | tee route.log
+          ! grep -q 'dev br-' route.log || { echo "172.18.97.242 still routed into a Docker bridge" | tee -a agents-check.log; exit 1; }
       - name: Laptop agent without a webhook (GET /receive, DEMO.md kịch bản 4)
         run: |
           # The runner plays the laptop: outside the Docker network, no route, it only calls the broker.
