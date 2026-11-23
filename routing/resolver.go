@@ -23,6 +23,13 @@ const maxRegistryResponseBytes = 1 << 20
 // fetches its messages with GET /receive, for example an agent without a public IP.
 const PullRoute = "pull"
 
+// PullEndpoint is the endpoint an agent without a webhook registers in the Service
+// Registry, whose Agent Card requires one: the reserved .invalid domain never resolves,
+// and the broker reads it as "this agent polls GET /receive".
+const PullEndpoint = "https://pull.invalid"
+
+const pullEndpointHost = "pull.invalid"
+
 // registryStatusUnregistered is the Service Registry status of an agent that left.
 const registryStatusUnregistered = "UNREGISTERED"
 
@@ -32,6 +39,16 @@ var (
 	// ErrPullOnly reports a known agent that has no webhook: it polls GET /receive.
 	ErrPullOnly = errors.New("agent has no webhook and receives messages with GET /receive")
 )
+
+// IsPullRoute reports whether a route or registry endpoint marks an agent that polls
+// GET /receive instead of receiving webhooks: "pull", or a URL on host pull.invalid.
+func IsPullRoute(route string) bool {
+	if route == PullRoute {
+		return true
+	}
+	parsed, err := url.Parse(route)
+	return err == nil && strings.EqualFold(parsed.Hostname(), pullEndpointHost)
+}
 
 // Resolver maps an agent ID to the URL that receives its webhooks. It returns
 // ErrAgentNotFound for an unknown agent and ErrPullOnly for a known agent that
@@ -62,14 +79,14 @@ func NewStaticResolver(routes map[string]string) (*StaticResolver, error) {
 	return &StaticResolver{routes: copied}, nil
 }
 
-// Resolve returns the configured URL for agentID, ErrPullOnly for a "pull" route,
-// or ErrAgentNotFound.
+// Resolve returns the configured URL for agentID, ErrPullOnly for a pull route
+// ("pull" or https://pull.invalid), or ErrAgentNotFound.
 func (r *StaticResolver) Resolve(_ context.Context, agentID string) (string, error) {
 	webhookURL, ok := r.routes[agentID]
 	if !ok {
 		return "", fmt.Errorf("%w: %q has no static route", ErrAgentNotFound, agentID)
 	}
-	if webhookURL == PullRoute {
+	if IsPullRoute(webhookURL) {
 		return "", fmt.Errorf("%w: %q", ErrPullOnly, agentID)
 	}
 	return webhookURL, nil
@@ -128,7 +145,8 @@ func ValidateWebhookURL(raw string) error {
 // means the agent is not registered. A 2xx response must be a JSON object carrying the
 // webhook URL in "webhook_url" (or, as fallbacks, "endpoint" or "url"). Other statuses
 // (ONLINE, SUSPECT, UNREACHABLE) still resolve: the broker keeps retrying until the
-// agent acknowledges. Adjust parseRegistryResponse if the registry changes its shape.
+// agent acknowledges. An endpoint on host pull.invalid (PullEndpoint) resolves to
+// ErrPullOnly. Adjust parseRegistryResponse if the registry changes its shape.
 type HTTPResolver struct {
 	lookupURL string
 	client    *http.Client
@@ -167,8 +185,21 @@ func NewHTTPResolver(lookupURL string, client *http.Client, cacheTTL time.Durati
 	}, nil
 }
 
-// Resolve returns the registered webhook URL, using the cache when it is still fresh.
+// Resolve returns the registered webhook URL, using the cache when it is still fresh,
+// or ErrPullOnly when the agent registered PullEndpoint.
 func (r *HTTPResolver) Resolve(ctx context.Context, agentID string) (string, error) {
+	webhookURL, err := r.lookup(ctx, agentID)
+	if err != nil {
+		return "", err
+	}
+	if IsPullRoute(webhookURL) {
+		return "", fmt.Errorf("%w: registry endpoint of %q is %s", ErrPullOnly, agentID, webhookURL)
+	}
+	return webhookURL, nil
+}
+
+// lookup returns the URL registered for agentID, from the cache or the registry.
+func (r *HTTPResolver) lookup(ctx context.Context, agentID string) (string, error) {
 	if webhookURL, ok := r.cached(agentID); ok {
 		return webhookURL, nil
 	}

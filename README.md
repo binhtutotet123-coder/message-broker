@@ -46,7 +46,7 @@ broker với `REGISTRY_LOOKUP_URL='http://localhost:8082/agents/{agent_id}'`.
 |-----------------------|-------------------------------------------------|---------|
 | `BROKER_ADDR`         | `:8080`                                         | Địa chỉ lắng nghe |
 | `RETRY_INTERVAL`      | `5s`                                            | Chờ ACK bao lâu trước khi gửi lại |
-| `AGENT_ROUTES`        | `agent_B=http://localhost:8081/webhook/receive` | Bảng định tuyến tĩnh `id=url,id=url`; `id=pull` cho agent chỉ kéo tin; đặt rỗng để chỉ dùng registry |
+| `AGENT_ROUTES`        | `agent_B=http://localhost:8081/webhook/receive` | Bảng định tuyến tĩnh `id=url,id=url`; `id=pull` (hoặc `id=https://pull.invalid`) cho agent chỉ kéo tin; đặt rỗng để chỉ dùng registry |
 | `REGISTRY_LOOKUP_URL` | (trống)                                         | URL tra cứu registry, phải chứa `{agent_id}` |
 | `REGISTRY_CACHE_TTL`  | `30s`                                           | Thời gian cache kết quả registry (`0s` = không cache) |
 | `FAULT_INJECTION`     | `false`                                         | Bật API `/admin/fault` |
@@ -66,8 +66,11 @@ Registry (hoặc Registry ghi `status: UNREGISTERED`), và không đang kéo tin
 broker vẫn nhận tin (`202`) và thử lại sau.
 
 **API của Team 1 (Agent Registry, [HPHind110/agent-registry](https://github.com/HPHind110/agent-registry)):**
-đặt `REGISTRY_LOOKUP_URL=http://<registry>:8000/v1/agents/{agent_id}`. Broker đọc trường `endpoint`
-(ưu tiên `webhook_url` nếu có) và `status`; `404` hoặc `UNREGISTERED` nghĩa là agent không tồn tại.
+đặt `REGISTRY_LOOKUP_URL=https://103-180-134-53.sslip.io/v1/agents/{agent_id}` (đang dùng trên server).
+Broker đọc trường `endpoint` (ưu tiên `webhook_url` nếu có) và `status`; `404` hoặc `UNREGISTERED`
+nghĩa là agent không tồn tại. Agent không có webhook đăng ký `endpoint` là `https://pull.invalid`
+(Registry bắt buộc có endpoint): broker không đẩy tin mà giữ tin cho agent kéo về, và không tính đó
+là một lần gửi.
 Nếu Team 1 đổi định dạng, chỉ cần sửa `parseRegistryResponse` trong
 [`routing/resolver.go`](routing/resolver.go).
 

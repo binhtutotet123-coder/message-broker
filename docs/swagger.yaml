@@ -65,6 +65,7 @@ paths:
         Dành cho các Agent dùng cơ chế Pull (không cần IP public). Gọi API này để lấy các tin nhắn đang có status PENDING dành cho mình.
         Mỗi tin trả về vẫn phải ACK qua /messages/{message_id}/ack. Chưa ACK thì sau RETRY_INTERVAL (5 giây) tin lại có trong lần gọi tiếp theo,
         nên Agent phải lọc trùng theo message_id. Trong lúc một Agent đang gọi API này (và 60 giây sau lần gọi cuối), Broker không đẩy webhook tới Agent đó.
+        Agent không có webhook mà đăng ký ở Service Registry thì ghi endpoint là https://pull.invalid: Broker không bao giờ đẩy webhook tới Agent đó.
       security:
         - BearerAuth: []
       parameters:

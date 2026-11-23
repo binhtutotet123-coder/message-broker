@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"message-broker/broker"
 	"message-broker/models"
 	"message-broker/routing"
 )
@@ -113,5 +114,19 @@ func TestHealthAndAdminRoutes(t *testing.T) {
 	handler.ServeHTTP(admin, httptest.NewRequest(http.MethodGet, "/admin/fault", nil))
 	if admin.Code != http.StatusNotFound {
 		t.Fatalf("/admin/fault without FAULT_INJECTION status = %d, want 404", admin.Code)
+	}
+}
+
+// TestWebhookDeliveryReportsPullOnlyRecipients maps a pull route to broker.ErrPullOnly
+// without calling anything, so the worker leaves the message for GET /receive.
+func TestWebhookDeliveryReportsPullOnlyRecipients(t *testing.T) {
+	resolver, err := routing.NewStaticResolver(map[string]string{"laptop": routing.PullEndpoint})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery := webhookDelivery{resolver: resolver, client: http.DefaultClient}
+	envelope := models.MessageEnvelope{MessageID: "p1", From: "agent_A", To: "laptop", Type: "request", Payload: map[string]interface{}{}}
+	if err := delivery.deliver(context.Background(), envelope, "trace"); !errors.Is(err, broker.ErrPullOnly) {
+		t.Fatalf("error = %v, want broker.ErrPullOnly", err)
 	}
 }

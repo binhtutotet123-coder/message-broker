@@ -46,7 +46,7 @@ func main() {
 	}
 	var pullAgents []string
 	for agentID, route := range cfg.AgentRoutes {
-		if route == routing.PullRoute {
+		if routing.IsPullRoute(route) {
 			pullAgents = append(pullAgents, agentID)
 		}
 	}

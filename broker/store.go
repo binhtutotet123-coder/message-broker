@@ -51,6 +51,9 @@ type MessageStore interface {
 	ClaimDueFor(agentID string, now, nextAttemptAt time.Time, limit int) ([]MessageRecord, error)
 	// Release ends a delivery claim only if its token still owns the lease.
 	Release(messageID, leaseToken string, retryAt time.Time) error
+	// Unclaim ends a delivery claim that never reached the agent (it has no webhook):
+	// the claim does not count as an attempt and the message stays due.
+	Unclaim(messageID, leaseToken string) error
 }
 
 // MemoryStore is a process-local implementation of MessageStore.
@@ -220,6 +223,27 @@ func (s *MemoryStore) Release(messageID, leaseToken string, retryAt time.Time) e
 		if record.NextAttemptAt.Before(retryAt) {
 			record.NextAttemptAt = retryAt
 		}
+	}
+	s.messages[messageID] = record
+	return nil
+}
+
+// Unclaim clears the lease for its current owner and takes back the claimed attempt.
+func (s *MemoryStore) Unclaim(messageID, leaseToken string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	record, ok := s.messages[messageID]
+	if !ok {
+		return ErrMessageNotFound
+	}
+	if record.LeaseToken != leaseToken {
+		return nil
+	}
+	record.LeaseUntil = time.Time{}
+	record.LeaseToken = ""
+	if record.Attempts > 0 {
+		record.Attempts--
 	}
 	s.messages[messageID] = record
 	return nil
