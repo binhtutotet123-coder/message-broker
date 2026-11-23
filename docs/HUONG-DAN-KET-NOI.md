@@ -1,7 +1,11 @@
 # Hướng dẫn kết nối Message Broker (Team 2)
 
-Broker là "bưu điện" chung của lớp: agent gửi tin cho broker, broker tìm địa chỉ người nhận, chuyển tin
-tới webhook của họ và gửi lại cho tới khi người nhận xác nhận (ACK).
+Broker là "bưu điện" chung của lớp: agent gửi tin cho broker, broker giữ tin cho người nhận và giao lại
+cho tới khi người nhận xác nhận (ACK). Người nhận lấy tin theo một trong hai cách:
+
+- **Kéo về (`GET /receive`)**: agent tự hỏi broker "có tin cho tôi không". Chỉ cần gọi ra ngoài, nên
+  **không cần IP public**: chạy được trên laptop ở nhà, ở trường. Nên dùng cách này.
+- **Webhook**: broker gọi vào địa chỉ của agent. Máy chạy agent phải có địa chỉ mà server gọi tới được.
 
 - **Địa chỉ broker:** `http://103.81.84.102:8080`
 - **Kiểm tra broker đang chạy:** mở `http://103.81.84.102:8080/healthz` thấy `ok`.
@@ -11,8 +15,8 @@ tới webhook của họ và gửi lại cho tới khi người nhận xác nh�
 
 ## Tóm tắt 4 việc mỗi nhóm cần làm
 
-1. Gửi cho Team 2 **`agent_id`** và **URL webhook** của nhóm (mục 1).
-2. Dựng **webhook nhận tin**: nhận POST, trả `200` ngay (mục 4).
+1. Chọn **`agent_id`** cho agent của nhóm (mục 1).
+2. **Nhận tin**: kéo về bằng `GET /receive` (không cần IP public), hoặc dựng webhook (mục 4).
 3. Xử lý xong thì **gọi ACK** (mục 5) và **lọc tin trùng** theo `message_id` (mục 6).
 4. Gửi tin cho agent khác qua **`POST /send`** (mục 3).
 
@@ -20,16 +24,18 @@ Muốn nhanh: dùng agent mẫu [`examples/python/agent.py`](../examples/python/
 
 ## 1. Đăng ký agent
 
-Gửi cho Team 2 qua nhóm chat của lớp:
+**`agent_id`**: tên duy nhất của agent, không có dấu cách, ví dụ `team_08_news`. Nên dùng đúng
+`agent_id` đã đăng ký ở Service Registry của Team 1.
 
-- **`agent_id`**: tên duy nhất của agent, không có dấu cách, ví dụ `team_08_news`.
-- **URL webhook**: địa chỉ broker sẽ POST tin tới, ví dụ `http://1.2.3.4:9000/webhook/receive`.
-  Server `103.81.84.102` phải **gọi tới được** địa chỉ này: dùng IP public hoặc tên miền, không dùng
-  `localhost` hay IP mạng nhà/wifi trường. Agent chạy trên laptop thì cần một đường hầm như
-  [ngrok](https://ngrok.com) hoặc Cloudflare Tunnel để có URL public.
+- **Agent kéo tin về (`GET /receive`)**: không cần đăng ký gì với Team 2. Khi agent đang kéo tin, broker
+  đã biết agent đó và nhận tin gửi cho nó. Muốn agent khác gửi được tin cho bạn cả lúc agent của bạn
+  chưa chạy, nhắn Team 2 `agent_id` để thêm vào bảng định tuyến dưới dạng `team_08_news=pull`.
+- **Agent nhận qua webhook**: gửi cho Team 2 `agent_id` và **URL webhook**, ví dụ
+  `http://1.2.3.4:9000/webhook/receive`. Server `103.81.84.102` phải **gọi tới được** địa chỉ này:
+  dùng IP public hoặc tên miền, không dùng `localhost` hay IP mạng nhà/wifi trường.
 
-Team 2 thêm agent vào bảng định tuyến của broker. Khi Service Registry của Team 1 hoạt động, broker sẽ
-tra địa chỉ qua registry và các nhóm đăng ký với Team 1.
+Broker cũng tra địa chỉ trong Service Registry của Team 1 (`GET /v1/agents/{agent_id}`, trường
+`endpoint`); agent có trạng thái `UNREGISTERED` ở đó được coi là không tồn tại.
 
 ## 2. Định dạng tin nhắn
 
@@ -82,15 +88,43 @@ Trên Windows, chạy lệnh này trong Git Bash, hoặc dùng agent mẫu ở m
 |---|---|---|
 | `202` + `"duplicate": true` | Gửi lại đúng tin cũ (cùng `message_id`, cùng nội dung) | Không sao: broker không tạo bản thứ hai. Nên gửi lại kiểu này khi mạng lỗi |
 | `400` | Thiếu trường, sai `type`, `payload` không phải object, JSON sai | Đọc trường `message` trong phản hồi để biết lỗi |
+| `404` | Người nhận (`to`) chưa đăng ký ở đâu cả: không có trong bảng định tuyến, không có trong Registry (hoặc đã `UNREGISTERED`), và không đang kéo tin | Kiểm tra lại `to`; người nhận dùng `GET /receive` thì phải đang chạy |
 | `409` | `message_id` đã dùng cho một tin **khác nội dung** | Tạo `message_id` mới |
 | `500` | Lỗi phía broker | Thử lại sau, báo Team 2 |
 
 Lỗi luôn có dạng `{"code": 400, "message": "type must be request, response, or final"}`.
 
-Broker trả `202` kể cả khi người nhận chưa đăng ký hoặc đang offline: tin được giữ lại và broker thử
-gửi lại mỗi 5 giây cho tới khi người nhận online.
+Người nhận đã đăng ký nhưng đang offline thì broker vẫn trả `202`: tin được giữ lại và giao khi người
+nhận online (webhook: thử lại mỗi 5 giây; kéo tin: lần kéo tiếp theo). Nếu Registry tạm thời không trả
+lời, broker cũng trả `202` và thử lại sau.
 
-## 4. Nhận tin: webhook
+## 4. Nhận tin
+
+### Cách 1: kéo về bằng `GET /receive` (không cần IP public)
+
+```bash
+curl "http://103.81.84.102:8080/receive?agent_id=team_08_news&wait=20"
+```
+
+| Tham số | Mặc định | Ý nghĩa |
+|---|---|---|
+| `agent_id` | bắt buộc | `agent_id` của nhóm bạn |
+| `limit` | `10` | Số tin tối đa mỗi lần (1–100) |
+| `wait` | `0` | Chưa có tin thì broker chờ tối đa bao nhiêu giây (tối đa 30) rồi mới trả lời. Đặt `20` để tin tới gần như ngay mà không phải gọi liên tục |
+
+Kết quả `200` là một mảng tin (mảng rỗng `[]` nếu chưa có tin). Mỗi tin là nguyên tin nhắn ở mục 2,
+thêm trường `trace_id` (mã theo dõi của tin, dùng làm `X-Trace-Id` khi trả lời):
+
+```json
+[{"message_id":"m-123","timestamp":"2026-11-23T08:00:00Z","from":"agent_A","to":"team_08_news","type":"request","payload":{"query":"tin tức hôm nay"},"trace_id":"trace-42"}]
+```
+
+- Gọi lại `GET /receive` liên tục trong một vòng lặp (agent mẫu ở mục 8 làm sẵn).
+- Tin kéo về **vẫn phải ACK** (mục 5). Chưa ACK thì sau 5 giây tin lại nằm trong lần kéo tiếp theo,
+  nên vẫn phải **lọc tin trùng** (mục 6).
+- Trong lúc agent đang kéo tin (và 60 giây sau lần kéo cuối), broker không gọi webhook của agent đó.
+
+### Cách 2: webhook
 
 Broker gửi `POST` tới URL webhook của bạn, body là nguyên tin nhắn ở mục 2, header `X-Trace-Id`.
 
@@ -141,13 +175,18 @@ Trả lời là gửi một **tin mới** qua `POST /send`:
 ## 8. Agent mẫu Python
 
 [`examples/python/agent.py`](../examples/python/agent.py): chỉ dùng thư viện chuẩn Python 3.8+, không cần
-cài thêm gì. Đã làm sẵn webhook, lọc trùng, ACK, gửi tin, và tự trả lời mỗi `request` bằng một `response`.
+cài thêm gì. Đã làm sẵn nhận tin (kéo về hoặc webhook), lọc trùng, ACK, gửi tin, và tự trả lời mỗi
+`request` bằng một `response`.
 
 ```bash
-# Chạy webhook nhận tin ở cổng 9000 (PowerShell: $env:AGENT_ID="team_08_news"; python agent.py serve)
+# Nhận tin bằng cách kéo về: chạy được trên laptop, không cần IP public
+# (PowerShell: $env:AGENT_ID="team_08_news"; python agent.py poll)
+AGENT_ID=team_08_news python agent.py poll
+
+# Hoặc nhận tin qua webhook ở cổng 9000 (máy phải có IP public)
 AGENT_ID=team_08_news PORT=9000 python agent.py serve
 
-# Gửi thử một tin tới agent_B
+# Ở cửa sổ khác: gửi thử một tin tới agent_B
 AGENT_ID=team_08_news python agent.py send agent_B xin chào
 ```
 
@@ -156,8 +195,8 @@ Logic của agent nằm trong hàm `handle()`: sửa hàm này, phần còn lạ
 ## 9. Chưa có, sẽ bổ sung
 
 - **Xác thực token (Team 3):** sau này mọi request cần header `Authorization: Bearer <token>`.
-- **Đăng ký qua Service Registry (Team 1)** thay cho việc gửi webhook cho Team 2.
-- **`GET /receive`:** cho agent không có webhook public tự đến lấy tin.
+- **Nối với Service Registry của Team 1 trên server:** broker đã tra được Registry (đã chạy thử), đang
+  chờ hai nhóm mở kết nối giữa hai server.
 - **TTL và Dead-letter queue:** hiện tin không giao được sẽ được thử lại mãi.
 - **Lưu database:** hiện broker lưu tin trong bộ nhớ, broker khởi động lại thì tin chưa giao bị mất.
 

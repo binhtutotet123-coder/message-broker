@@ -127,6 +127,52 @@ Lời giải thích: `dieu_phoi` vẫn được 202 dù `tin_tuc` đang tắt. B
 thử lại, và giao ngay khi `tin_tuc` sống lại. Bên gửi không phải tự viết logic thử lại.
 Đây là lợi ích chính của việc đi qua broker thay vì các agent gọi thẳng nhau.
 
+## Kịch bản 4: agent trên laptop, không cần IP public
+
+Ba kịch bản trên chạy trong server. Kịch bản này cho thấy một agent chạy trên **laptop** (sau router
+nhà/wifi trường, không có IP public) vẫn nói chuyện được với `tin_tuc` trên server, nhờ nhận tin bằng
+cách kéo về (`GET /receive`). Cần Python 3.8+ trên laptop, không cài thêm gì.
+
+Tải [`examples/python/agent.py`](examples/python/agent.py) về laptop. Mở **hai** cửa sổ PowerShell ở thư
+mục chứa file đó.
+
+Cửa sổ 1, agent của laptop kéo tin về:
+
+```powershell
+$env:AGENT_ID="laptop_nhom2"; python agent.py poll
+```
+
+Cửa sổ 2, gửi câu hỏi tới `tin_tuc` trên server:
+
+```powershell
+$env:AGENT_ID="laptop_nhom2"; python agent.py send tin_tuc "cho minh tin cong nghe"
+```
+
+Cửa sổ 1 hiện câu trả lời của `tin_tuc` (3 tin) và dòng `đã gửi ACK success`. Trên server,
+`./scripts/demo-agents.sh logs` hiện:
+
+```
+broker        | Agent laptop_nhom2 is polling GET /receive: its messages wait at the broker instead of being pushed to a webhook
+broker        | Accepted message 86f1... for tin_tuc (duplicate=false)
+broker        | Agent tin_tuc accepted message 86f1... at http://demo-tin-tuc:9102/webhook/receive via HTTP 200 OK; waiting for ACK
+broker        | Accepted message ddd9... for laptop_nhom2 (duplicate=false)
+broker        | ACK success from tin_tuc for message 86f1...; status now Delivered after 1 attempt(s)
+broker        | Agent laptop_nhom2 pulled message ddd9... via GET /receive; waiting for ACK
+broker        | ACK success from laptop_nhom2 for message ddd9...; status now Delivered after 1 attempt(s)
+```
+
+Lời giải thích: laptop chỉ **gọi ra** broker (gửi tin, kéo tin, ACK), không ai phải gọi vào laptop, nên
+không cần IP public hay ngrok. Broker giữ câu trả lời của `tin_tuc` cho tới khi laptop kéo về. Mọi quy
+tắc vẫn như cũ: vẫn ACK, vẫn lọc trùng; chưa ACK thì 5 giây sau tin lại có trong lần kéo tiếp theo.
+
+Gửi tới một agent không tồn tại thì broker báo lỗi ngay:
+
+```powershell
+$env:AGENT_ID="laptop_nhom2"; python agent.py send khong_ton_tai "xin chao"
+```
+
+ra `Gửi thất bại: /send trả HTTP 404: ... recipient "khong_ton_tai" is not registered ...`.
+
 ## Lệnh khác
 
 | Lệnh | Tác dụng |

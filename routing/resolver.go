@@ -19,10 +19,23 @@ const AgentIDPlaceholder = "{agent_id}"
 
 const maxRegistryResponseBytes = 1 << 20
 
-// ErrAgentNotFound reports that no route is registered for an agent.
-var ErrAgentNotFound = errors.New("agent not found in registry")
+// PullRoute is the AGENT_ROUTES value for an agent that has no webhook and instead
+// fetches its messages with GET /receive, for example an agent without a public IP.
+const PullRoute = "pull"
 
-// Resolver maps an agent ID to the URL that receives its webhooks.
+// registryStatusUnregistered is the Service Registry status of an agent that left.
+const registryStatusUnregistered = "UNREGISTERED"
+
+var (
+	// ErrAgentNotFound reports that no route is registered for an agent.
+	ErrAgentNotFound = errors.New("agent not found in registry")
+	// ErrPullOnly reports a known agent that has no webhook: it polls GET /receive.
+	ErrPullOnly = errors.New("agent has no webhook and receives messages with GET /receive")
+)
+
+// Resolver maps an agent ID to the URL that receives its webhooks. It returns
+// ErrAgentNotFound for an unknown agent and ErrPullOnly for a known agent that
+// fetches its messages itself.
 type Resolver interface {
 	Resolve(ctx context.Context, agentID string) (string, error)
 }
@@ -39,24 +52,31 @@ func NewStaticResolver(routes map[string]string) (*StaticResolver, error) {
 		if strings.TrimSpace(agentID) == "" {
 			return nil, errors.New("route agent ID must not be empty")
 		}
-		if err := ValidateWebhookURL(webhookURL); err != nil {
-			return nil, fmt.Errorf("route for %q: %w", agentID, err)
+		if webhookURL != PullRoute {
+			if err := ValidateWebhookURL(webhookURL); err != nil {
+				return nil, fmt.Errorf("route for %q: %w", agentID, err)
+			}
 		}
 		copied[agentID] = webhookURL
 	}
 	return &StaticResolver{routes: copied}, nil
 }
 
-// Resolve returns the configured URL for agentID or ErrAgentNotFound.
+// Resolve returns the configured URL for agentID, ErrPullOnly for a "pull" route,
+// or ErrAgentNotFound.
 func (r *StaticResolver) Resolve(_ context.Context, agentID string) (string, error) {
 	webhookURL, ok := r.routes[agentID]
 	if !ok {
 		return "", fmt.Errorf("%w: %q has no static route", ErrAgentNotFound, agentID)
 	}
+	if webhookURL == PullRoute {
+		return "", fmt.Errorf("%w: %q", ErrPullOnly, agentID)
+	}
 	return webhookURL, nil
 }
 
 // ParseRoutes parses "agent_B=http://host:8081/webhook/receive,agent_C=http://other/hook".
+// The value "pull" ("team_08=pull") marks an agent that polls GET /receive instead.
 // Blank entries are ignored so that an empty string yields an empty table.
 func ParseRoutes(spec string) (map[string]string, error) {
 	routes := make(map[string]string)
@@ -73,6 +93,10 @@ func ParseRoutes(spec string) (map[string]string, error) {
 		}
 		if _, duplicate := routes[agentID]; duplicate {
 			return nil, fmt.Errorf("route for %q is defined more than once", agentID)
+		}
+		if strings.EqualFold(webhookURL, PullRoute) {
+			routes[agentID] = PullRoute
+			continue
 		}
 		if err := ValidateWebhookURL(webhookURL); err != nil {
 			return nil, fmt.Errorf("route for %q: %w", agentID, err)
@@ -99,10 +123,12 @@ func ValidateWebhookURL(raw string) error {
 
 // HTTPResolver looks agents up in the Service Registry and caches successful lookups.
 //
-// The lookup URL is a template such as "http://registry:8082/agents/{agent_id}". A 404
-// response means the agent is not registered. A 2xx response must be a JSON object
-// carrying the webhook URL in "webhook_url" (or, as fallbacks, "endpoint" or "url").
-// Adjust parseRegistryResponse if the registry team settles on another shape.
+// The lookup URL is a template such as "http://registry:8000/v1/agents/{agent_id}" (the
+// Team 1 Agent Registry). A 404 response, or an entry whose "status" is UNREGISTERED,
+// means the agent is not registered. A 2xx response must be a JSON object carrying the
+// webhook URL in "webhook_url" (or, as fallbacks, "endpoint" or "url"). Other statuses
+// (ONLINE, SUSPECT, UNREACHABLE) still resolve: the broker keeps retrying until the
+// agent acknowledges. Adjust parseRegistryResponse if the registry changes its shape.
 type HTTPResolver struct {
 	lookupURL string
 	client    *http.Client
@@ -173,9 +199,12 @@ func (r *HTTPResolver) Resolve(ctx context.Context, agentID string) (string, err
 		return "", fmt.Errorf("registry returned HTTP %s for %q", resp.Status, agentID)
 	}
 
-	webhookURL, err := parseRegistryResponse(body)
+	webhookURL, status, err := parseRegistryResponse(body)
 	if err != nil {
 		return "", fmt.Errorf("registry entry for %q: %w", agentID, err)
+	}
+	if strings.EqualFold(status, registryStatusUnregistered) {
+		return "", fmt.Errorf("%w: registry lists %q as %s", ErrAgentNotFound, agentID, registryStatusUnregistered)
 	}
 	r.store(agentID, webhookURL)
 	return webhookURL, nil
@@ -205,39 +234,41 @@ func (r *HTTPResolver) store(agentID, webhookURL string) {
 	r.cache[agentID] = cachedRoute{webhookURL: webhookURL, expiresAt: r.now().Add(r.cacheTTL)}
 }
 
-// parseRegistryResponse extracts and validates the webhook URL from a registry entry.
-func parseRegistryResponse(body []byte) (string, error) {
+// parseRegistryResponse extracts the webhook URL and lifecycle status from a registry entry.
+func parseRegistryResponse(body []byte) (webhookURL, status string, err error) {
 	var entry struct {
 		WebhookURL string `json:"webhook_url"`
 		Endpoint   string `json:"endpoint"`
 		URL        string `json:"url"`
+		Status     string `json:"status"`
 	}
 	if err := json.Unmarshal(body, &entry); err != nil {
-		return "", fmt.Errorf("decode JSON: %w", err)
+		return "", "", fmt.Errorf("decode JSON: %w", err)
 	}
 	for _, candidate := range []string{entry.WebhookURL, entry.Endpoint, entry.URL} {
 		if candidate != "" {
 			if err := ValidateWebhookURL(candidate); err != nil {
-				return "", err
+				return "", "", err
 			}
-			return candidate, nil
+			return candidate, entry.Status, nil
 		}
 	}
-	return "", errors.New(`response has no "webhook_url", "endpoint" or "url" field`)
+	return "", "", errors.New(`response has no "webhook_url", "endpoint" or "url" field`)
 }
 
 // Chain tries resolvers in order and returns the first route found.
 type Chain []Resolver
 
-// Resolve returns the first URL any resolver finds. If none finds one, it returns the
-// first error other than ErrAgentNotFound (for example a registry outage), so the
-// broker retries instead of treating a temporary failure as an unknown agent.
+// Resolve returns the first URL any resolver finds, or ErrPullOnly as soon as one knows
+// the agent as pull-only. If none knows the agent, it returns the first error other than
+// ErrAgentNotFound (for example a registry outage), so the broker retries instead of
+// treating a temporary failure as an unknown agent.
 func (c Chain) Resolve(ctx context.Context, agentID string) (string, error) {
 	var firstFailure error
 	for _, resolver := range c {
 		webhookURL, err := resolver.Resolve(ctx, agentID)
-		if err == nil {
-			return webhookURL, nil
+		if err == nil || errors.Is(err, ErrPullOnly) {
+			return webhookURL, err
 		}
 		if !errors.Is(err, ErrAgentNotFound) && firstFailure == nil {
 			firstFailure = err

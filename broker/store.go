@@ -43,7 +43,12 @@ type MessageStore interface {
 	// Get retrieves a record by its idempotency key.
 	Get(messageID string) (record MessageRecord, found bool, err error)
 	// ClaimDue atomically claims one due record with the provided token and lease expiry.
-	ClaimDue(now, leaseUntil time.Time, leaseToken string) (record MessageRecord, found bool, err error)
+	// Records whose recipient makes skip return true are left alone; skip may be nil.
+	ClaimDue(now, leaseUntil time.Time, leaseToken string, skip func(recipient string) bool) (record MessageRecord, found bool, err error)
+	// ClaimDueFor hands up to limit due records addressed to agentID to that agent
+	// (GET /receive): each counts as an attempt and is due again at nextAttemptAt
+	// unless the agent acknowledges it first.
+	ClaimDueFor(agentID string, now, nextAttemptAt time.Time, limit int) ([]MessageRecord, error)
 	// Release ends a delivery claim only if its token still owns the lease.
 	Release(messageID, leaseToken string, retryAt time.Time) error
 }
@@ -126,20 +131,65 @@ func (s *MemoryStore) Get(messageID string) (MessageRecord, bool, error) {
 }
 
 // ClaimDue atomically reserves the earliest pending message until its lease expires.
-func (s *MemoryStore) ClaimDue(now, leaseUntil time.Time, leaseToken string) (MessageRecord, bool, error) {
+func (s *MemoryStore) ClaimDue(now, leaseUntil time.Time, leaseToken string, skip func(string) bool) (MessageRecord, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	messageIDs := make([]string, 0, len(s.messages))
+	messageIDs := s.dueLocked(now, func(record MessageRecord) bool {
+		return skip == nil || !skip(record.Envelope.To)
+	})
+	if len(messageIDs) == 0 {
+		return MessageRecord{}, false, nil
+	}
+
+	record := s.messages[messageIDs[0]]
+	record.LeaseUntil = leaseUntil
+	record.LeaseToken = leaseToken
+	record.Attempts++
+	s.messages[messageIDs[0]] = record
+	copy, err := cloneRecord(record)
+	return copy, true, err
+}
+
+// ClaimDueFor hands the earliest due messages for agentID to a polling agent.
+func (s *MemoryStore) ClaimDueFor(agentID string, now, nextAttemptAt time.Time, limit int) ([]MessageRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	messageIDs := s.dueLocked(now, func(record MessageRecord) bool {
+		return record.Envelope.To == agentID
+	})
+	if len(messageIDs) > limit {
+		messageIDs = messageIDs[:limit]
+	}
+	claimed := make([]MessageRecord, 0, len(messageIDs))
+	for _, messageID := range messageIDs {
+		record := s.messages[messageID]
+		record.Attempts++
+		record.NextAttemptAt = nextAttemptAt
+		record.LeaseUntil = time.Time{}
+		record.LeaseToken = ""
+		s.messages[messageID] = record
+		copy, err := cloneRecord(record)
+		if err != nil {
+			return nil, err
+		}
+		claimed = append(claimed, copy)
+	}
+	return claimed, nil
+}
+
+// dueLocked lists pending, unleased messages whose retry time has come and that
+// match include, earliest first. The caller must hold s.mu.
+func (s *MemoryStore) dueLocked(now time.Time, include func(MessageRecord) bool) []string {
+	messageIDs := make([]string, 0)
 	for messageID, record := range s.messages {
 		if record.Status == StatusPending &&
 			!record.LeaseUntil.After(now) &&
-			!record.NextAttemptAt.After(now) {
+			!record.NextAttemptAt.After(now) &&
+			include(record) {
 			messageIDs = append(messageIDs, messageID)
 		}
-	}
-	if len(messageIDs) == 0 {
-		return MessageRecord{}, false, nil
 	}
 	sort.Slice(messageIDs, func(i, j int) bool {
 		left := s.messages[messageIDs[i]]
@@ -149,14 +199,7 @@ func (s *MemoryStore) ClaimDue(now, leaseUntil time.Time, leaseToken string) (Me
 		}
 		return left.NextAttemptAt.Before(right.NextAttemptAt)
 	})
-
-	record := s.messages[messageIDs[0]]
-	record.LeaseUntil = leaseUntil
-	record.LeaseToken = leaseToken
-	record.Attempts++
-	s.messages[messageIDs[0]] = record
-	copy, err := cloneRecord(record)
-	return copy, true, err
+	return messageIDs
 }
 
 // Release clears the lease only for its current owner and delays a pending retry.

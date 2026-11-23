@@ -164,3 +164,55 @@ func TestChainPrefersFoundRoutesAndSurfacesOutages(t *testing.T) {
 		t.Fatalf("chain without routes error = %v, want ErrAgentNotFound", err)
 	}
 }
+
+// TestPullRoutes covers "agent=pull" entries for agents without a webhook.
+func TestPullRoutes(t *testing.T) {
+	routes, err := ParseRoutes("agent_B=http://agent-b:8081/webhook/receive, laptop=pull, other=PULL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routes["laptop"] != PullRoute || routes["other"] != PullRoute {
+		t.Fatalf("pull routes = %v", routes)
+	}
+	resolver, err := NewStaticResolver(routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.Resolve(context.Background(), "laptop"); !errors.Is(err, ErrPullOnly) {
+		t.Fatalf("Resolve(laptop) error = %v, want ErrPullOnly", err)
+	}
+
+	// A pull-only agent is known: the chain stops there instead of asking the registry.
+	var asked atomic.Int32
+	registry := resolverFunc(func(context.Context, string) (string, error) {
+		asked.Add(1)
+		return "http://registry-route/hook", nil
+	})
+	if _, err := (Chain{resolver, registry}).Resolve(context.Background(), "laptop"); !errors.Is(err, ErrPullOnly) || asked.Load() != 0 {
+		t.Fatalf("chain for pull agent = %v (registry asked %d times), want ErrPullOnly without asking", err, asked.Load())
+	}
+}
+
+// TestHTTPResolverHonoursRegistryStatus treats UNREGISTERED agents as unknown, as the
+// Team 1 Agent Registry keeps them listed with that status after they leave.
+func TestHTTPResolverHonoursRegistryStatus(t *testing.T) {
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		status := r.URL.Path[len("/v1/agents/"):]
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"agent_id":"x","endpoint":"http://agent:9000/webhook/receive","status":"` + status + `"}`))
+	}))
+	defer registry.Close()
+
+	resolver, err := NewHTTPResolver(registry.URL+"/v1/agents/{agent_id}", registry.Client(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.Resolve(context.Background(), "UNREGISTERED"); !errors.Is(err, ErrAgentNotFound) {
+		t.Fatalf("UNREGISTERED agent error = %v, want ErrAgentNotFound", err)
+	}
+	for _, status := range []string{"ONLINE", "SUSPECT", "UNREACHABLE"} {
+		if got, err := resolver.Resolve(context.Background(), status); err != nil || got != "http://agent:9000/webhook/receive" {
+			t.Fatalf("%s agent = (%q, %v), want its endpoint", status, got, err)
+		}
+	}
+}
