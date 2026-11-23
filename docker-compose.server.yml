@@ -79,3 +79,12 @@ services:
       PORT: "9102"
       BROKER_URL: "http://broker:8080"
       PYTHONDONTWRITEBYTECODE: "1"
+
+# Mạng nội bộ của các container. Đặt dải cố định để không trùng với dải 172.18.0.0/16
+# mà Docker hay tự chọn: nếu trùng, server không gọi được máy thật có IP trong dải đó
+# (ví dụ Registry của Team 1 ở 172.18.97.242), vì nó tưởng địa chỉ đó nằm trong Docker.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: "${BROKER_NETWORK_SUBNET:-10.213.0.0/24}"
